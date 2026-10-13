@@ -38,6 +38,12 @@ each file taken from them:
   Font License 1.1, (c) 2020 The JetBrains Mono Project Authors,
   `app/fonts/OFL.txt`: the font of the Touch ID panel (`app/fonts`, bundled
   unchanged in OmacVM.app's Contents/Resources/fonts).
+- **Apple Darwin declarations** in `app/usb-session-experimental/activation/darwin_unique.h`
+  and `app/usb-session-experimental/helper/darwin_unique.h` are extracted from XNU
+  and retain their APSL-2.0 notices; these portions are not MIT. The opt-in
+  experiment's [third-party notices](app/usb-session-experimental/THIRD_PARTY_NOTICES.md)
+  include the full license and the separately downloaded LGPL libusb/usbredir
+  source and relinking requirements. No experimental helper binary is bundled.
 - **Omanotch** (`src/omanotch/`) has its own README and licence.
 - **Textual** and what it needs (`src/control/vendor/`, the VM's control
   centre), unchanged wheels from PyPI, each with its licence inside

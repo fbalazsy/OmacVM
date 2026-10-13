@@ -69,6 +69,11 @@ jobs:
           git ls-files -z '*.py' | xargs -0 python3 -m py_compile
           python3 -m py_compile src/control/omacvm
 
+      - name: USBredir runtime recipe tests (offline, no QEMU build or USB access)
+        run: |
+          python3 app/runtime/Tests/usbredir/test-ci.py
+          python3 app/runtime/Tests/usbredir/test-runtime.py
+
       - name: omacvm report runs on macOS's own python3
         run: /usr/bin/python3 -c "import sys; sys.path.insert(0, 'src/control'); import omacvm_cc.report, omacvm_cc.collect, omacvm_cc.bridge, omacvm_cc.state"
 

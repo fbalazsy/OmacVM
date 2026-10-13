@@ -4,12 +4,14 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: macos/prepare-qemu-gpu-runtime.sh --source-qemu PATH --source-slirp PATH --source-virgl PATH [--source-kosmickrisp PATH] [--archive-dir DIR]
+Usage: macos/prepare-qemu-gpu-runtime.sh --source-qemu PATH --source-slirp PATH --source-virgl PATH --source-usbredir PATH --usbredir-license PATH [--source-kosmickrisp PATH] [--archive-dir DIR]
 
 Stage, relocate, validate, and ad-hoc sign the source-built QEMU runtime at:
   macos/.build/qemu-gpu-runtime
 
-QEMU, libslirp, and VirGL are source-built; the remaining runtime closure comes from
+QEMU, libslirp, VirGL, and the usbredir parser are source-built;
+--usbredir-license names usbredir's COPYING.LIB from the pinned source archive.
+The remaining runtime closure comes from
 checksum-pinned bottles compatible with macOS 15 or newer;
 it never reads or bundles libraries from the build machine's Homebrew prefix.
 With --source-kosmickrisp, the runtime also carries KosmicKrisp (Mesa's Vulkan on
@@ -23,9 +25,23 @@ source_qemu=
 source_slirp=
 source_virgl=
 source_kosmickrisp=
+source_usbredir=
+usbredir_license=
 archive_cache=
 while (($#)); do
   case "$1" in
+    --source-usbredir)
+      (($# >= 2)) || { usage >&2; exit 64; }
+      [[ -z $source_usbredir && -n $2 && $2 != --* ]] || { usage >&2; exit 64; }
+      source_usbredir=$2
+      shift 2
+      ;;
+    --usbredir-license)
+      (($# >= 2)) || { usage >&2; exit 64; }
+      [[ -z $usbredir_license && -n $2 && $2 != --* ]] || { usage >&2; exit 64; }
+      usbredir_license=$2
+      shift 2
+      ;;
     --source-qemu)
       (($# >= 2)) || { usage >&2; exit 64; }
       [[ -z $source_qemu ]] || { usage >&2; exit 64; }
@@ -111,6 +127,10 @@ done
 macos_major=$(sw_vers -productVersion | awk -F. '{ print $1 }')
 [[ $macos_major =~ ^[0-9]+$ ]] || die "could not determine the macOS version"
 ((macos_major >= 15)) || die "the pinned GPU bottles require macOS 15 or newer"
+[[ $source_usbredir == /* && -f $source_usbredir && ! -L $source_usbredir ]] || \
+  die "--source-usbredir must name an absolute regular parser library path"
+[[ $usbredir_license == /* && -f $usbredir_license && -s $usbredir_license && ! -L $usbredir_license ]] || \
+  die "--usbredir-license must name an absolute nonempty regular license file"
 [[ -n $source_virgl ]] || die "--source-virgl is required"
 [[ $source_virgl == /* && -f $source_virgl && ! -L $source_virgl ]] || \
   die "--source-virgl must name an absolute regular library path"
@@ -250,6 +270,9 @@ tar -xzf "$epoxy_archive" -C "$extract_dir" "$epoxy_member"
 tar -xzf "$angle_archive" -C "$extract_dir" "$egl_member" "$gles_member"
 
 install -m 0755 "$source_qemu" "$staged_runtime/bin/qemu-system-aarch64"
+install -m 0755 "$source_usbredir" "$staged_runtime/lib/libusbredirparser.1.dylib"
+mkdir -p "$staged_runtime/share/licenses"
+install -m 0644 "$usbredir_license" "$staged_runtime/share/licenses/LICENSE.usbredir.txt"
 install -m 0755 "$source_virgl" \
   "$staged_runtime/lib/libvirglrenderer.1.dylib"
 install -m 0755 "$extract_dir/$epoxy_member" "$staged_runtime/lib/libepoxy.0.dylib"
@@ -388,12 +411,13 @@ verify_runtime_tree() {
     elif [[ -d $path ]]; then
       [[ $relative == bin || $relative == lib || $relative == share || \
          $relative == share/vulkan || $relative == share/vulkan/icd.d || \
-         ( -n $source_kosmickrisp && $relative == share/licenses ) ]] || \
+         $relative == share/licenses ]] || \
         die "runtime contains an unexpected directory: $relative"
     elif [[ -f $path && " ${vulkan_icds[*]} " == *" $relative "* ]]; then
       python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$path" || \
         die "invalid Vulkan driver file: $relative"
-    elif [[ -n $source_kosmickrisp && $relative == share/licenses/LICENSE.mesa-kosmickrisp.txt ]]; then
+    elif [[ $relative == share/licenses/LICENSE.usbredir.txt || \
+            ( -n $source_kosmickrisp && $relative == share/licenses/LICENSE.mesa-kosmickrisp.txt ) ]]; then
       [[ -s $path ]] || die "empty licence notice: $relative"
     elif [[ -f $path ]]; then
       is_expected_runtime_file "$relative" || \
@@ -405,6 +429,9 @@ verify_runtime_tree() {
   done < <(find "$root" -mindepth 1 -print0)
   ((actual_count == ${#runtime_files[@]})) || \
     die "runtime file set is incomplete"
+
+  [[ -f $root/share/licenses/LICENSE.usbredir.txt && -s $root/share/licenses/LICENSE.usbredir.txt ]] || \
+    die "runtime is missing the usbredir license"
 
   for relative in "${runtime_files[@]}"; do
     path="$root/$relative"
@@ -478,6 +505,8 @@ verify_runtime_tree() {
   device_help=$("$qemu" -device help 2>&1) || \
     die "relocated QEMU could not enumerate devices: $device_help"
   for device in \
+    'name "usb-host"' \
+    'name "usb-redir"' \
     'name "virtio-gpu-gl-pci"' \
     'name "intel-hda"' \
     'name "hda-micro"' \

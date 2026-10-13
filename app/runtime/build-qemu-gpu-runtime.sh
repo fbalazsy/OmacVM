@@ -13,7 +13,9 @@ atomically stage it at:
   macos/.build/qemu-gpu-runtime
 
 The build is Apple-Silicon/HVF-only. It enables Cocoa+VirGL, SLIRP user
-networking, SDL duplex audio, and virtio-9p folder sharing. All downloaded source archives and wheels are
+networking, SDL duplex audio, virtio-9p folder sharing, and USB redirection.
+Only the usbredir parser library is packaged, not its host tools.
+All downloaded source archives and wheels are
 immutable and checksum-pinned; scratch sources are removed on every exit.
 
 It also builds the UEFI firmware with Omarchy's boot logo (build-edk2.sh);
@@ -211,6 +213,12 @@ meson_archive_name="$meson_root.tar.gz"
 meson_url="https://github.com/mesonbuild/meson/releases/download/1.9.0/$meson_archive_name"
 meson_sha256=cd27277649b5ed50d19875031de516e270b22e890d9db65ed9af57d18ebc498d
 macos_deployment_target=15.0
+
+usbredir_version=0.15.0
+usbredir_source_root="usbredir-$usbredir_version"
+usbredir_archive_name="$usbredir_source_root.tar.xz"
+usbredir_url="https://www.spice-space.org/download/usbredir/$usbredir_archive_name"
+usbredir_sha256=6dc2a380277688a068191245dac2ab7063a552999d8ac3ad8e841c10ff050961
 
 keycodemap_commit=f5772a62ec52591ff6870b7e8ef32482371f22c6
 keycodemap_root="keycodemapdb-$keycodemap_commit"
@@ -473,6 +481,42 @@ validate_tar_root() {
   done <"$listing"
 }
 
+# The usbredir release is xz, not a bottle. Refuse links, special files and
+# ambiguous paths before tar writes anything into the private source directory.
+validate_usbredir_archive() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive_path, root = sys.argv[1:]
+try:
+    with tarfile.open(archive_path, "r:xz") as archive:
+        entries = {}
+        for member in archive:
+            name = member.name.rstrip("/") if member.isdir() else member.name
+            path = pathlib.PurePosixPath(name)
+            if (not path.parts or path.is_absolute() or ".." in path.parts
+                    or path.parts[0] != root or str(path) != name
+                    or "\\" in name or any(ord(c) < 32 or ord(c) == 127 for c in name)
+                    or not (member.isfile() or member.isdir()) or member.issparse()
+                    or (name == root and not member.isdir())):
+                raise ValueError(f"unsafe member: {member.name!r}")
+            key = name.casefold()
+            if key in entries:
+                raise ValueError(f"duplicate member: {member.name!r}")
+            entries[key] = member.isdir()
+        if not entries:
+            raise ValueError("empty archive")
+        for name in entries:
+            for parent in pathlib.PurePosixPath(name).parents:
+                if str(parent) in entries and not entries[str(parent)]:
+                    raise ValueError(f"non-directory parent: {parent}")
+except (OSError, EOFError, tarfile.TarError, ValueError) as error:
+    raise SystemExit(f"unsafe usbredir archive: {error}")
+PY
+}
+
 slirp_archive="$archive_dir/$slirp_archive_name"
 meson_archive="$archive_dir/$meson_archive_name"
 qemu_archive="$archive_dir/$qemu_archive_name"
@@ -488,6 +532,11 @@ setuptools_archive="$archive_dir/$setuptools_archive_name"
 wheel_archive="$archive_dir/$wheel_archive_name"
 packaging_archive="$archive_dir/$packaging_archive_name"
 pip_archive="$archive_dir/$pip_archive_name"
+
+usbredir_archive="$archive_dir/$usbredir_archive_name"
+obtain_and_verify "usbredir source" "$usbredir_url" "$usbredir_sha256" "$usbredir_archive"
+validate_usbredir_archive "$usbredir_archive" "$usbredir_source_root"
+tar -xf "$usbredir_archive" -C "$source_parent"
 
 obtain_and_verify "libslirp source" "$slirp_url" "$slirp_sha256" "$slirp_archive"
 obtain_and_verify "Meson" "$meson_url" "$meson_sha256" "$meson_archive"
@@ -994,6 +1043,28 @@ require_private_pkg_version sdl2 2.32.70
 require_private_pkg_version epoxy 1.5.11
 require_private_pkg_version libusb-1.0 1.0.30
 
+# Build and test privately; QEMU and the runtime use only the parser library.
+usbredir_root="$dependency_root/usbredir/$usbredir_version"
+usbredir_build="$source_parent/$usbredir_source_root/build"
+meson="$tool_root/$meson_root/meson.py"
+log "Building usbredir $usbredir_version for macOS $macos_deployment_target"
+env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
+  PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$pkg_config_libdir" \
+  DYLD_LIBRARY_PATH="$private_libraries" PATH="$(dirname "$ninja"):$PATH" \
+  CFLAGS="-mmacosx-version-min=$macos_deployment_target -Werror=unguarded-availability-new" \
+  LDFLAGS="-mmacosx-version-min=$macos_deployment_target -Wl,-headerpad_max_install_names" \
+  python3 "$meson" setup "$usbredir_build" "$source_parent/$usbredir_source_root" \
+    --prefix="$usbredir_root" --libdir=lib --buildtype=release --wrap-mode=nodownload \
+    -Dtools=disabled -Dtests=enabled
+"$ninja" ${ninja_jobs[@]+"${ninja_jobs[@]}"} -C "$usbredir_build"
+env DYLD_LIBRARY_PATH="$private_libraries" \
+  python3 "$meson" test -C "$usbredir_build" --no-rebuild \
+    --num-processes "${OMARCHY_RUNTIME_BUILD_JOBS:-4}" --print-errorlogs
+python3 "$meson" install -C "$usbredir_build" --no-rebuild
+pkg_config_libdir="$usbredir_root/lib/pkgconfig:$pkg_config_libdir"
+private_libraries="$usbredir_root/lib:$private_libraries"
+require_private_pkg_version libusbredirparser-0.5 "$usbredir_version"
+
 # Keep the exact graphics fixes, including GLES dual-source output for Alacritty.
 virgl_source="$source_parent/$virgl_source_root"
 virgl_tap="$source_parent/$virgl_tap_root"
@@ -1260,6 +1331,7 @@ log "Configuring QEMU 11.1.1 (HVF-only, Cocoa/VirGL, SLIRP, SDL audio, virtio-9p
       --audio-drv-list=sdl \
       --enable-virtfs \
       --enable-libusb \
+      --enable-usb-redir \
       --disable-debug-info \
       --disable-werror \
       --disable-download \
@@ -1356,6 +1428,8 @@ log "Relocating, capability-gating, signing, and publishing the runtime"
   --source-qemu "$qemu_binary" \
   --source-slirp "$slirp_root/lib/libslirp.0.dylib" \
   --source-virgl "$virgl_root/lib/libvirglrenderer.1.dylib" \
+  --source-usbredir "$usbredir_root/lib/libusbredirparser.1.dylib" \
+  --usbredir-license "$source_parent/$usbredir_source_root/COPYING.LIB" \
   ${kosmickrisp_args[@]+"${kosmickrisp_args[@]}"} \
   --archive-dir "$archive_dir"
 

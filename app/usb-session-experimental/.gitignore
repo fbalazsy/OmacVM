@@ -1,0 +1,14 @@
+# Private profiles and generated authority must stay out of the repository.
+/cache/
+/build*/
+/private*/
+*.local.json
+__pycache__/
+*.pyc
+/activation/local_pins.h
+/activation/local_pins.py
+/BUILD.json
+/TEST-RESULTS.json
+/helper/vendor/
+/helper/build/
+/activation/build/
