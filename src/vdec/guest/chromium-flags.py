@@ -4,8 +4,14 @@ chromium-flags.py on|off|check
 
   --enable-features=AcceleratedVideoDecoder   Chromium's V4L2 decoder, off by
       default in builds without VA-API (Arch Linux ARM's)
-  --load-extension=/usr/local/share/omacvm/chromium-no-av1   YouTube sends
+  --load-extension=/usr/local/lib/omacvm/chromium-no-av1   YouTube sends
       VP9 instead of AV1, which this Chromium decodes only on the CPU
+
+The extension lives beside this script, not in /usr/local/share/omacvm: apply
+replaces that whole tree, and an apply of only some features (a repair, a
+feature switch) does not install Chromium video again. Up to 3.1.4 it was
+there and such an apply left Chromium a missing extension ("Failed to load
+extension"); "on" moves the old path in the user's file to the new one.
 
 Chromium keeps only the LAST of each switch on its command line, and Arch's
 launcher reads /etc/chromium-flags.conf, then ~/.config/chromium-flags.conf
@@ -15,11 +21,16 @@ the user's file (several flags may share a line), or into a new line with
 ~/.local/state/omacvm remembers what was added, so "off" never removes what
 the user set. Files are replaced whole (a temporary file, then a rename), so
 Chromium never reads half a file; a linked file stays a link (its target is
-replaced). check: exit 0 when Chromium would get both."""
+replaced). check: exit 0 when Chromium would get both and the extension is
+there."""
 import json, os, pwd, re, sys, tempfile
 
+NO_AV1 = "/usr/local/lib/omacvm/chromium-no-av1"
 ADD = {"--enable-features=": "AcceleratedVideoDecoder",
-       "--load-extension=": "/usr/local/share/omacvm/chromium-no-av1"}
+       "--load-extension=": NO_AV1}
+# What ADD had before (up to 3.1.4): "on" puts ADD's value in its place, "off"
+# takes either out.
+OLD = {"--load-extension=": "/usr/local/share/omacvm/chromium-no-av1"}
 ETC = "/etc/chromium-flags.conf"
 HOME = pwd.getpwuid(os.getuid()).pw_dir   # not $HOME: runuser keeps root's
 USER_FILE = f"{HOME}/.config/chromium-flags.conf"
@@ -56,6 +67,12 @@ def effective(switch):
         if hit:
             return values(hit[1])
     return []
+
+
+def hit_value(ls, switch, value):
+    """VALUE is in what Chromium gets for SWITCH, with LS as the user's file."""
+    hit = last_switch(ls, switch) or last_switch(lines(ETC), switch)
+    return bool(hit) and value in values(hit[1])
 
 
 def write(path, text):
@@ -97,10 +114,38 @@ def load_mark():
         return {}
 
 
+def migrate(ls, mark):
+    """OLD's values in the user's file become ADD's (in place, once). True when
+    a line changed; a line the marker remembers is remembered as it is now."""
+    changed = False
+    for switch, old in OLD.items():
+        for i, l in enumerate(ls):
+            if l.lstrip().startswith("#"):
+                continue
+            def swap(m):
+                v = values(m)
+                if old not in v:
+                    return m.group(0)
+                new = []
+                for x in v:
+                    x = ADD[switch] if x == old else x
+                    if x not in new:
+                        new.append(x)
+                return switch + ",".join(new)
+            n = re.sub(r"(?<!\S)" + re.escape(switch) + r"(\S*)", swap, l)
+            if n != l:
+                if mark.get(switch) == "line " + l:
+                    mark[switch] = "line " + n
+                ls[i] = n
+                changed = True
+    return changed
+
+
 def on():
-    mark, ls, changed = load_mark(), lines(USER_FILE), False
+    mark, ls = load_mark(), lines(USER_FILE)
+    changed = migrate(ls, mark)
     for switch, value in ADD.items():
-        if value in effective(switch):
+        if hit_value(ls, switch, value):
             continue
         hit = last_switch(ls, switch)
         if hit:
@@ -132,12 +177,17 @@ def off():
         hit = last_switch(ls, switch)
         if hit:
             i, m = hit
-            rest = [x for x in values(m) if x != value]
+            rest = [x for x in values(m) if x not in (value, OLD.get(switch))]
             ls[i] = (ls[i][:m.start()] + (switch + ",".join(rest) if rest else "") + ls[i][m.end():]).rstrip()
             if not ls[i].strip():
                 del ls[i]
     write_lines(USER_FILE, ls)
     os.remove(MARK)
+
+
+def check():
+    return all(v in effective(s) for s, v in ADD.items()) and \
+        os.path.isfile(os.path.join(NO_AV1, "manifest.json"))
 
 
 if __name__ == "__main__":
@@ -147,6 +197,6 @@ if __name__ == "__main__":
     elif cmd == "off":
         off()
     elif cmd == "check":
-        sys.exit(0 if all(v in effective(s) for s, v in ADD.items()) else 1)
+        sys.exit(0 if check() else 1)
     else:
         sys.exit("usage: chromium-flags.py on|off|check")

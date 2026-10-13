@@ -58,7 +58,7 @@ if [[ $ON == off ]]; then
   systemctl disable --now omacvm-vdecd.service >/dev/null 2>&1 || true
   modprobe -r omacvm_vdec 2>/dev/null || true
   dkms_remove $NAME
-  rm -rf /usr/local/share/omacvm/chromium-no-av1
+  rm -rf "$LIB/chromium-no-av1"
   rm -f /etc/systemd/system/omacvm-vdecd.service "$BIN" "$LIB/chromium-flags.py" \
     /etc/udev/rules.d/70-omacvm-vdec.rules /etc/modules-load.d/omacvm-vdec.conf \
     /etc/sysusers.d/omacvm-vdec.conf /etc/pacman.d/hooks/95-omacvm-vdecd.hook "$STAMP" "$WP"
@@ -86,7 +86,9 @@ daemon_new=0; cmp -s "$T/omacvm-vdecd" "$BIN" || daemon_new=1
 unit_new=0; cmp -s omacvm-vdecd.service /etc/systemd/system/omacvm-vdecd.service || unit_new=1
 install -m755 "$T/omacvm-vdecd" "$BIN"   # a new file: a running daemon keeps its own
 install -Dm755 chromium-flags.py "$LIB/chromium-flags.py"
-install -Dm644 -t /usr/local/share/omacvm/chromium-no-av1 no-av1/manifest.json no-av1/no-av1.js
+# The extension beside it, not in /usr/local/share/omacvm: apply replaces that
+# whole tree, also when it installs only other features (chromium-flags.py).
+install -Dm644 -t "$LIB/chromium-no-av1" no-av1/manifest.json no-av1/no-av1.js
 install -Dm644 omacvm-vdec.sysusers /etc/sysusers.d/omacvm-vdec.conf
 systemd-sysusers /etc/sysusers.d/omacvm-vdec.conf
 install -m644 70-omacvm-vdec.rules /etc/udev/rules.d/

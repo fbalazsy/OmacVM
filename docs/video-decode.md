@@ -152,6 +152,10 @@ Chromium ◀─ its GPU buffer (ARGB) ◀─ GPU pass in omacvm-vdecd
   merged into Omarchy's last `--enable-features` and `--load-extension` (Chromium
   takes only the last of each). The extension tells YouTube that AV1 is not
   supported, so YouTube sends VP9: this Chromium decodes AV1 only on the CPU.
+  It lives in `/usr/local/lib/omacvm/chromium-no-av1`, outside the copy of
+  OmacVM that every `omacvm apply` replaces (up to 3.1.4 it was in that copy,
+  and an apply of other features left Chromium saying "Failed to load
+  extension" at each start).
 - When the GPU is not usable (a Mesa update that broke GBM), the daemon
   waits and exits, and systemd starts it again: after 2 seconds at first,
   then less often, up to every 2 minutes. Once it is ready the wait starts

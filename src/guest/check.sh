@@ -576,7 +576,7 @@ app)
     elif ! systemctl is-active -q omacvm-vdecd || [[ -z $s ]]; then
       w=$(/usr/local/share/omacvm/vdec/guest/vdecd.sh why 2>/dev/null)
       bad "video decoding in Chromium" "omacvm-vdecd down: ${w:-not running (journalctl -u omacvm-vdecd)}$pend"
-    elif ! as_user /usr/local/lib/omacvm/chromium-flags.py check; then bad "video decoding in Chromium" "AcceleratedVideoDecoder missing in Chromium's flags: omacvm apply"
+    elif ! as_user /usr/local/lib/omacvm/chromium-flags.py check; then bad "video decoding in Chromium" "Chromium's flags or its no-AV1 extension missing: omacvm apply"
     else ok "video decoding in Chromium" "V4L2 -> the Mac's media engine: $s$pend"; fi
   fi
   FEATURE=""
