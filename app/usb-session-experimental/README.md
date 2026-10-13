@@ -67,6 +67,11 @@ python3 -B build.py --profile profiles/fixture.json \
 python3 -B build-fixture/source/test.py
 ```
 
+CI runs these same fixture build/test commands in its own temporary directory,
+without sudo or a physical profile. Its existing runner selection and fork
+approval rules stay unchanged. `app/runtime/Tests/usbredir/test-ci.py` guards
+this wiring; the runtime recipe tests are a separate, download-free step.
+
 The initial `--download` fetches the public, SHA-256-pinned upstream archives.
 Subsequent builds omit it and use checksum-verified cache files. Nothing is
 fetched at install time. If the selected SDK is incompatible with clang, set

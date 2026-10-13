@@ -74,6 +74,12 @@ jobs:
           python3 app/runtime/Tests/usbredir/test-ci.py
           python3 app/runtime/Tests/usbredir/test-runtime.py
 
+      - name: USB session fixture (no root, USB or VM)
+        timeout-minutes: 10
+        run: |
+          python3 -B app/usb-session-experimental/build.py --profile app/usb-session-experimental/profiles/fixture.json --out "$JOB_TMP/usb" --cache "$JOB_TMP/usb-cache" --download
+          python3 -B "$JOB_TMP/usb/source/test.py"
+
       - name: omacvm report runs on macOS's own python3
         run: /usr/bin/python3 -c "import sys; sys.path.insert(0, 'src/control'); import omacvm_cc.report, omacvm_cc.collect, omacvm_cc.bridge, omacvm_cc.state"
 

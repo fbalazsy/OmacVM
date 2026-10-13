@@ -72,6 +72,8 @@ src/tests/venus-driver.sh
 src/tests/vulkan-feature.sh && src/tests/venus-build-tools.sh && src/tests/graphics-setting.sh && src/tests/pkg-safe.sh
 src/tests/app-paths.sh
 src/tests/ci-app-build.sh
+python3 app/runtime/Tests/usbredir/test-ci.py
+python3 app/runtime/Tests/usbredir/test-runtime.py
 app/runtime/Tests/display/test-pointer-guard.sh
 app/runtime/Tests/display/test-pointer-start.sh
 src/tests/app-fullscreen-space.sh
@@ -96,6 +98,12 @@ PNGs from a fixture home, without a window (not in CI).
 
 The Mac side runs on macOS's `/bin/bash` 3.2: no `declare -A`, `mapfile`
 or `${var,,}`.
+
+The experimental USB session also has a [synthetic build and offline
+suite](app/usb-session-experimental/README.md#build-and-offline-tests-ordinary-uid-only),
+run by CI as an ordinary user. It downloads checksum-pinned sources, builds
+the native pair and exercises its lifecycle without root, USB access or a VM.
+It does not test a physical profile or the app's USB UI.
 
 **On a VM.** Use a test VM, not the one you live in:
 
