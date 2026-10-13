@@ -492,6 +492,9 @@ jobs:
       - name: Sound does not hang on Chromium's video decoder (WirePlumber rule, install order, off); its device starts the daemon
         run: src/tests/vdec-wireplumber.sh
 
+      - name: Chromium's no-AV1 extension survives an apply of other features (its place, 3.1.4's path moved, check)
+        run: src/tests/chromium-no-av1.sh
+
       - name: Chrome's WebRTC encoder flags survive Update VM and come back at a start
         run: src/tests/video-encode-flags.sh
 
