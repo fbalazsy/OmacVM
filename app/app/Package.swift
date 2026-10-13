@@ -29,7 +29,7 @@ let package = Package(
         // The VM's USB devices: which ones the Mac lets a VM have, the VM's
         // choice and QEMU's arguments, without a VM: `swift run usb-tests`.
         .target(name: "OmacVMUSB"),
-        .executableTarget(name: "usb-tests", dependencies: ["OmacVMUSB"]),
+        .executableTarget(name: "usb-tests", dependencies: ["OmacVMUSB"], exclude: ["composition.py"]),
         // The Mac folder's QEMU arguments: `swift run folder-tests`.
         .target(name: "OmacVMFolder"),
         .executableTarget(name: "folder-tests", dependencies: ["OmacVMFolder"]),

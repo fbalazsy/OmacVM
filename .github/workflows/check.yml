@@ -125,11 +125,25 @@ jobs:
 
       - name: OmacVM.app USB device tests (which devices a VM may have, QEMU arguments)
         working-directory: app/app
-        run: swift run usb-tests
+        run: swift run usb-tests --offline
+
+      - name: USBredir pinned runtime recipe (offline, no QEMU build or hardware)
+        run: |
+          python3 app/runtime/Tests/usbredir/test-ci.py
+          python3 app/runtime/Tests/usbredir/test-runtime.py
 
       - name: OmacVM.app Mac folder arguments
         working-directory: app/app
         run: swift run folder-tests
+
+      - name: App-owned USB helper build and offline tests (no root or devices)
+        run: |
+          python3 src/tests/usb-helper-bundle.py
+          python3 src/tests/qmp-values.py
+          python3 src/tests/usb-bootstrap-contract.py
+          python3 app/app/Sources/usb-tests/composition.py
+          python3 app/usb-helper/build.py --out "$RUNNER_TEMP/usb-helper" --cache "$RUNNER_TEMP/usb-helper-cache" --download
+          python3 app/usb-helper/test.py --out "$RUNNER_TEMP/usb-helper-tests" --cache "$RUNNER_TEMP/usb-helper-cache"
 
       - name: OmacVM.app build window tests (progress lines from the VM, speed, time left, log tail)
         working-directory: app/app

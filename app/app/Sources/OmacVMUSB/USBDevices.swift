@@ -47,10 +47,18 @@ public struct USBDevice: Equatable, Sendable {
         /// apps and services that opened it (usbmuxd, usbaudiod, ...).
         public var users: [String]
 
-        public init(number: Int, interfaceClass: Int, users: [String]) {
+        public var interfaceSubclass: Int
+        public var interfaceProtocol: Int
+        public var reportDescriptor: Data?
+
+        public init(number: Int, interfaceClass: Int, users: [String], interfaceSubclass: Int = -1,
+                    interfaceProtocol: Int = -1, reportDescriptor: Data? = nil) {
             self.number = number
             self.interfaceClass = interfaceClass
             self.users = users
+            self.interfaceSubclass = interfaceSubclass
+            self.interfaceProtocol = interfaceProtocol
+            self.reportDescriptor = reportDescriptor
         }
     }
 
@@ -71,9 +79,13 @@ public struct USBDevice: Equatable, Sendable {
     public var location: UInt32
     /// Its address on that bus ("USB Address"; libusb's device address on macOS).
     public var address: Int
+    /// Exact physical generation and raw identity, NEVER display-normalized.
+    public var registryID: UInt64
+    public var rawSerial: String
 
     public init(id: USBDeviceID, name: String, deviceClass: Int, drivers: [String] = [], interfaces: [Interface],
-                serial: String = "", maker: String = "", location: UInt32 = 0, address: Int = 0) {
+                serial: String = "", maker: String = "", location: UInt32 = 0, address: Int = 0,
+                registryID: UInt64 = 0, rawSerial: String? = nil) {
         self.id = id
         self.name = name
         self.deviceClass = deviceClass
@@ -83,6 +95,8 @@ public struct USBDevice: Equatable, Sendable {
         self.maker = maker
         self.location = location
         self.address = address
+        self.registryID = registryID
+        self.rawSerial = rawSerial ?? serial
     }
 
     /// libusb's bus number on macOS: the top byte of the locationID.
@@ -112,6 +126,9 @@ public struct USBDevice: Equatable, Sendable {
         // device has a vendor interface next to it).
         if deviceClass == 0x11 || interfaces.contains(where: { $0.interfaceClass == 0x11 }) {
             return .notOffered("a USB-C adapter's info device")
+        }
+        if deviceClass == 3 || interfaces.contains(where: { $0.interfaceClass == 3 }) {
+            return .usedByMac("macOS uses it as a keyboard, mouse or security key")
         }
         let users = drivers + interfaces.flatMap(\.users)
         if let u = users.first { return .usedByMac(USBDevice.reason(u)) }
@@ -256,17 +273,40 @@ public enum USBScan {
                     IOObjectRelease(u)
                 }
                 interfaces.append(.init(number: int(child, "bInterfaceNumber") ?? interfaces.count,
-                                        interfaceClass: int(child, "bInterfaceClass") ?? 0, users: users))
+                                        interfaceClass: int(child, "bInterfaceClass") ?? 0, users: users,
+                                        interfaceSubclass: int(child, "bInterfaceSubClass") ?? -1,
+                                        interfaceProtocol: int(child, "bInterfaceProtocol") ?? -1,
+                                        reportDescriptor: report(child)))
             } else if !USBDevice.ignoredDeviceChild(className: cls) {
                 drivers.append(user(child))
             }
         }
+        var registryID: UInt64 = 0
+        _ = IORegistryEntryGetRegistryEntryID(dev, &registryID)
+        let rawSerial = string(dev, "USB Serial Number") ?? string(dev, "kUSBSerialNumberString") ?? ""
         return USBDevice(id: id, name: name, deviceClass: int(dev, "bDeviceClass") ?? 0,
                          drivers: drivers, interfaces: interfaces.sorted { $0.number < $1.number },
-                         serial: USBChoice.clean(string(dev, "USB Serial Number") ?? string(dev, "kUSBSerialNumberString") ?? ""),
+                         serial: USBChoice.clean(rawSerial),
                          maker: USBChoice.clean(string(dev, "USB Vendor Name") ?? string(dev, "kUSBVendorString") ?? ""),
                          location: UInt32(truncatingIfNeeded: int(dev, "locationID") ?? 0),
-                         address: int(dev, "USB Address") ?? 0)
+                         address: int(dev, "USB Address") ?? 0, registryID: registryID, rawSerial: rawSerial)
+    }
+
+    // Read only an existing HID registry report, bounded traversal. No USB open.
+    static func report(_ entry: io_registry_entry_t, depth: Int = 0) -> Data? {
+        if let data = IORegistryEntryCreateCFProperty(entry, "ReportDescriptor" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Data {
+            return data.count <= 4096 ? data : nil
+        }
+        guard depth < 5 else { return nil }
+        var found: Data?
+        for child in children(entry) {
+            defer { IOObjectRelease(child) }
+            if let data = report(child, depth: depth + 1) {
+                if found != nil { return nil } // ambiguous multiple reports
+                found = data
+            }
+        }
+        return found
     }
 
     /// An app or service that opened it (its name), else the driver's class.

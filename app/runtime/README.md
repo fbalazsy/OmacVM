@@ -4,6 +4,10 @@ QEMU for OmacVM, built from source. The build scripts and patches come from
 [try-omarchy](https://github.com/omacom/try-omarchy) (MIT, `LICENSE.try-omarchy`),
 commit 82927e9. Changes here:
 
+USB redirection's build dependency and limits are described in
+[Tests/usbredir/README.md](Tests/usbredir/README.md). Compiling `usb-redir`
+does not connect a host device or change the app's USB policy.
+
 - scratch files go to `.build/tmp` instead of `/private/tmp` (macOS's temp folder when the
   checkout's path has a space: QEMU's configure refuses one)
 - `patches/omacvm-cocoa-identity.patch`: the app name and icon come from the

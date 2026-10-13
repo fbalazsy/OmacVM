@@ -33,6 +33,14 @@ OmacVM.app's own code is MIT (`LICENSE`). It ships or uses:
   virglrenderer is built with OmacVM's VideoToolbox video backend
   (`runtime/patches/virgl-videotoolbox-decode.patch`, MIT like
   virglrenderer); it uses Apple's VideoToolbox, part of macOS.
+- **usbredir** 0.15.0: its parser library, LGPL-2.1-or-later, dynamically
+  linked as the replaceable `libusbredirparser.1.dylib`. Built without
+  modifications from https://www.spice-space.org/download/usbredir/usbredir-0.15.0.tar.xz
+  (SHA-256 `6dc2a380277688a068191245dac2ab7063a552999d8ac3ad8e841c10ff050961`)
+  by `runtime/build-qemu-gpu-runtime.sh`. Its `COPYING.LIB` is shipped at
+  `Contents/Resources/runtime/share/licenses/LICENSE.usbredir.txt`.
+  The QEMU runtime does not ship the usbredir host library or tools; the
+  native USB helper statically links the host library (see `usb-helper/NOTICE.md`).
 - **Vulkan for the VM (Venus)**: MoltenVK 1.4.2 (Apache-2.0, The Brenwill
   Workshop / Khronos; with SPIRV-Cross and SPIRV-Tools, Apache-2.0, and
   cereal, BSD-3-Clause, built in) and the Khronos Vulkan loader 1.4.357

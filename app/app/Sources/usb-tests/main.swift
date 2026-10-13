@@ -7,6 +7,11 @@
 import Foundation
 import OmacVMUSB
 
+if CommandLine.arguments.contains("--offline") && (CommandLine.arguments.contains("--list") || CommandLine.arguments.contains("--qmp")) {
+    print("Offline mode cannot be combined with --list or --qmp")
+    exit(64)
+}
+
 if CommandLine.arguments.contains("--list") {
     for d in USBScan.devices() {
         let a: String
@@ -535,9 +540,15 @@ try? FileManager.default.removeItem(at: tmp)
 if let i = CommandLine.arguments.firstIndex(of: "--qmp"), i + 1 < CommandLine.arguments.count {
     qmpIntegration(qemu: CommandLine.arguments[i + 1], expect: { expect($0, $1) })
 }
-// The scan only reads the IORegistry; on any Mac it returns without opening anything.
-_ = USBScan.devices()
-expect(true, "the IORegistry scan runs")
+if !CommandLine.arguments.contains("--offline") {
+    // Explicit offline mode never scans IORegistry or opens a live QMP socket.
+    _ = USBScan.devices()
+    expect(true, "the IORegistry scan runs")
+}
+privilegedTests(expect: { expect($0, $1) })
+redirectionTests(expect: { expect($0, $1) })
+nativeWireTests(expect: { expect($0, $1) })
+nativeLifecycleTests(expect: { expect($0, $1) })
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

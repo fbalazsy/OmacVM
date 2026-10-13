@@ -221,6 +221,15 @@ xcrun clang -O2 -Wall -Wextra -Werror -mmacosx-version-min=14.0 \
   -DNETD_VERSION="\"$(shasum -a 256 "$NETD_SRC" | cut -c1-16)\"" -o "$NETD" "$NETD_SRC" \
   -framework vmnet -framework Security -framework CoreFoundation -lbsm
 
+# On-demand USB capture is part of this app release, never a per-device build.
+# Building/staging this payload does not install it or authorize USB capture.
+log "USB capture helper"
+python3 "$ROOT/usb-helper/build.py" --out "$ROOT/.build/usb-helper" \
+  --cache "$ROOT/.build/usb-helper-cache" --download
+USB_HELPER=$C/Library/LaunchServices/omacvm-usb-helper
+install -m755 "$ROOT/.build/usb-helper/omacvm-usb-helper" "$USB_HELPER"
+ditto "$ROOT/.build/usb-helper/relink" "$C/Resources/licenses/usb-helper-relink"
+
 # OmacVM's Mac helpers (Bridge, Gestures), built here from the src/ inside the
 # app and signed with it: omacvm apply/update and the app's own apply install
 # these copies (src/lib/helpers.sh), so the user's Mac compiles nothing and,
@@ -335,6 +344,7 @@ if [[ -n ${OMACVM_SIGN_ID:-} ]]; then
   codesign "${SIGN[@]}" --identifier "$ID.qemu" \
     --entitlements "$ROOT/runtime/qemu-hvf.entitlements" "$C/Resources/runtime/bin/OmacVM"
   codesign "${SIGN[@]}" --identifier org.omacvm.netd "$NETD"
+  codesign "${SIGN[@]}" --identifier org.omacvm.usb-helper "$USB_HELPER"
   codesign "${SIGN[@]}" --identifier "$BRIDGE_ID" --entitlements "$ROOT/app/OmacVMBridge.entitlements" "$C/Helpers/$BRIDGE_APP"
   codesign "${SIGN[@]}" --identifier "$GESTURES_ID" "$C/Helpers/$GESTURES_APP"
   codesign "${SIGN[@]}" --identifier "$ID.docktile" "$C/PlugIns/OmacVMDockTile.docktileplugin"
@@ -351,6 +361,7 @@ else
   codesign --force --sign - --identifier "$ID.qemu" -r="designated => identifier \"$ID.qemu\"" \
     --entitlements "$ROOT/runtime/qemu-hvf.entitlements" "$C/Resources/runtime/bin/OmacVM"
   codesign --force --sign - --identifier org.omacvm.netd "$NETD"
+  codesign --force --sign - --options runtime --identifier org.omacvm.usb-helper "$USB_HELPER"
   codesign --force --sign - --identifier "$ID.docktile" "$C/PlugIns/OmacVMDockTile.docktileplugin"
   # The helpers keep the signature their build gave them (src/lib/sign.sh: the same rule).
   codesign --force --sign - --identifier "$ID" -r="designated => identifier \"$ID\"" "$APP"

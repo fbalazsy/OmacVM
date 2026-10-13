@@ -9,6 +9,15 @@ import Foundation
 /// identifier. Calls are serialized because a QMP connection is an ordered
 /// byte stream.
 final class QMPConnection: @unchecked Sendable {
+    /// Only a well-formed, ID-matched QMP error proves definitive rejection.
+    /// Transport and malformed replies remain ambiguous to mutation callers.
+    struct Rejected: LocalizedError {
+        let command: String
+        let errorClass: String
+        let detail: String
+        var errorDescription: String? { "QMP command \(command) failed: \(detail)" }
+    }
+
     struct CommandExecution {
         let result: [String: Any]
         let events: [String]
@@ -88,6 +97,35 @@ final class QMPConnection: @unchecked Sendable {
         arguments: [String: Any]? = nil,
         timeoutMilliseconds: Int32 = 2_000
     ) throws -> CommandExecution {
+        let matched = try executeResponse(command, arguments: arguments,
+                                          timeoutMilliseconds: timeoutMilliseconds)
+        // Preserve the legacy dictionary/text API for existing callers.
+        if let text = matched.object["return"] as? String {
+            return CommandExecution(result: ["text": text], events: matched.events)
+        }
+        guard let result = matched.object["return"] as? [String: Any] else {
+            close()
+            throw HelperError.io("QMP command \(command) returned an invalid response")
+        }
+        return CommandExecution(result: result, events: matched.events)
+    }
+
+    /// QMP query commands also return booleans, arrays, numbers and JSON null.
+    func executeValue(
+        _ command: String,
+        arguments: [String: Any]? = nil,
+        timeoutMilliseconds: Int32 = 2_000
+    ) throws -> Any {
+        let matched = try executeResponse(command, arguments: arguments,
+                                          timeoutMilliseconds: timeoutMilliseconds)
+        return matched.object["return"]!
+    }
+
+    private func executeResponse(
+        _ command: String,
+        arguments: [String: Any]?,
+        timeoutMilliseconds: Int32
+    ) throws -> MatchedResponse {
         try queue.sync { [self] in
             guard !closed else {
                 throw HelperError.io("QMP control is unavailable")
@@ -110,18 +148,19 @@ final class QMPConnection: @unchecked Sendable {
                     throw HelperError.io("QMP command \(command) timed out")
                 }
                 let response = matched.object
-                if let error = response["error"] as? [String: Any] {
-                    let detail = error["desc"] as? String ?? "unknown QMP error"
-                    throw HelperError.io("QMP command \(command) failed: \(detail)")
+                if response["error"] != nil {
+                    guard response["return"] == nil,
+                          let error = response["error"] as? [String: Any],
+                          let errorClass = error["class"] as? String,
+                          let detail = error["desc"] as? String else {
+                        throw HelperError.io("QMP command \(command) returned a malformed error")
+                    }
+                    throw Rejected(command: command, errorClass: errorClass, detail: detail)
                 }
-                // human-monitor-command answers with text: kept under "text".
-                if let text = response["return"] as? String {
-                    return CommandExecution(result: ["text": text], events: matched.events)
-                }
-                guard let result = response["return"] as? [String: Any] else {
+                guard response["return"] != nil else {
                     throw HelperError.io("QMP command \(command) returned an invalid response")
                 }
-                return CommandExecution(result: result, events: matched.events)
+                return matched
             } catch {
                 closeWithoutSynchronization()
                 throw error

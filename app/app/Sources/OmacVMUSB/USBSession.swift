@@ -91,6 +91,10 @@ public final class USBSession {
         /// To be asked once the VM is in front.
         case waiting
         case asking
+        case captureAvailable, authorizing, capturing, releasing
+        case uncertain(String)
+        case captureEnded(String)
+        case captureRefused(String)
         case connecting
         case connected
         /// Unplugged while the VM had it: waiting `grace` for it to come back.
@@ -125,6 +129,11 @@ public final class USBSession {
     /// Something changed (the list follows it).
     public var onChange: (() -> Void)?
 
+    private let captureRun = UUID()
+    private var captures: [UInt32: USBCaptureGrant] = [:]
+    private var captureCancelled = Set<UUID>()
+    private var absentCaptures = Set<UInt32>()
+    private var replacementCaptures: [UInt32: USBDevice] = [:]
     private let machine: USBMachine
     private let asker: USBAsker
     private let clock: USBClock
@@ -147,6 +156,18 @@ public final class USBSession {
     /// A device appeared (or was there when the VM started).
     public func plugged(_ d: USBDevice) {
         guard !stopped else { return }
+        if let grant = captures[d.location] {
+            if grant.device.registryID != d.registryID {
+                replacementCaptures[d.location] = d
+                cancelCapture(d.location)
+            }
+            return
+        }
+        if d.captureCandidate, machine is USBCaptureMachine {
+            plugs[d.location] = Plug(device: d, state: .captureAvailable, how: "explicit Connect required")
+            changed()
+            return
+        }
         if var p = plugs[d.location] {
             // The same device back (same id and serial, still free): a reset.
             if p.state == .leaving && p.device.id == d.id && p.device.serial == d.serial && d.availability == .free {
@@ -190,6 +211,15 @@ public final class USBSession {
     /// A device went away.
     public func unplugged(location: UInt32) {
         guard !stopped, let p = plugs[location] else { return }
+        if captures[location] != nil {
+            // USBRun has checked the current registry generation before removal.
+            // The old grant remains the cleanup owner, but a queued replacement
+            // at this location is no longer present and must not be resurrected.
+            replacementCaptures[location] = nil
+            absentCaptures.insert(location)
+            cancelCapture(location)
+            return
+        }
         switch p.state {
         case .asking:
             asker.cancel()
@@ -264,7 +294,8 @@ public final class USBSession {
         if asking != nil { asker.cancel() }
         asking = nil
         queue.removeAll()
-        plugs.removeAll()
+        for location in Array(captures.keys) { cancelCapture(location) }
+        plugs = plugs.filter { captures[$0.key] != nil }
         changed()
     }
 
@@ -313,7 +344,7 @@ public final class USBSession {
     // MARK: Connect and disconnect
 
     private var connectedCount: Int {
-        plugs.values.filter { $0.state == .connected || $0.state == .connecting || $0.state == .leaving }.count
+        plugs.filter { captures[$0.key] != nil || $0.value.state == .connected || $0.value.state == .connecting || $0.value.state == .leaving }.count
     }
 
     private func connect(_ loc: UInt32, how: String) {
@@ -371,6 +402,25 @@ public final class USBSession {
     /// Gives a plugged-in device to the VM now (the list's Connect).
     public func connectNow(location: UInt32) {
         guard !stopped, let p = plugs[location] else { return }
+        let captureOffered: Bool
+        switch p.state { case .captureAvailable, .captureRefused: captureOffered = true; default: captureOffered = false }
+        if captureOffered {
+            guard inFront, p.device.captureCandidate, let capture = machine as? USBCaptureMachine else { return }
+            guard connectedCount < Self.maxConnected else {
+                plugs[location]?.state = .captureRefused("The VM already has four pending or connected USB devices")
+                changed(); return
+            }
+            let grant = USBCaptureGrant(run: captureRun, device: p.device)
+            captures[location] = grant // before any reentrant callback
+            plugs[location]?.state = .authorizing
+            changed()
+            guard !stopped, !captureCancelled.contains(grant.attempt) else {
+                captureEvent(grant, .refused("Cancelled before dispatch"))
+                return
+            }
+            capture.capture(grant) { [weak self] event in self?.captureEvent(grant, event) }
+            return
+        }
         switch p.state {
         case .onMac, .waiting:
             queue.removeAll { $0 == location }
@@ -382,12 +432,52 @@ public final class USBSession {
 
     /// Gives it back to the Mac now (the list's Disconnect).
     public func disconnectNow(location: UInt32) {
+        if captures[location] != nil { cancelCapture(location); return }
         guard !stopped, var p = plugs[location], p.state == .connected else { return }
         p.state = .onMac(remembered: false)
         p.how = "from the list"
         plugs[location] = p
         machine.detach(p.device) { _ in }
         log("OmacVM: USB: \(Self.label(p.device)) disconnected (from the list)")
+        changed()
+    }
+
+    private func cancelCapture(_ location: UInt32) {
+        guard let grant = captures[location] else { return }
+        let first = captureCancelled.insert(grant.attempt).inserted
+        if first {
+            plugs[location]?.state = .releasing
+            changed()
+            (machine as? USBCaptureMachine)?.cancelCapture(grant.attempt)
+        }
+    }
+
+    private func captureEvent(_ grant: USBCaptureGrant, _ event: USBCaptureEvent) {
+        let location = grant.device.location
+        guard captures[location]?.attempt == grant.attempt else { return }
+        let cancelled = captureCancelled.contains(grant.attempt)
+        switch event {
+        case .authorizing: if !cancelled { plugs[location]?.state = .authorizing }
+        case .capturing: if !cancelled { plugs[location]?.state = .capturing }
+        case .connected: if !cancelled { plugs[location]?.state = .connected }
+        case .releasing: plugs[location]?.state = .releasing
+        case .uncertain(let why): plugs[location]?.state = .uncertain(USBChoice.clean(why))
+        case .released(let restored):
+            captures[location] = nil
+            captureCancelled.remove(grant.attempt)
+            if stopped || absentCaptures.remove(location) != nil {
+                plugs[location] = nil
+            } else {
+                plugs[location]?.state = restored ? .captureAvailable : .captureEnded("Released; HID restoration not confirmed")
+            }
+            if let replacement = replacementCaptures.removeValue(forKey: location), !stopped { plugged(replacement) }
+        case .refused(let why):
+            captures[location] = nil
+            captureCancelled.remove(grant.attempt)
+            if stopped || absentCaptures.remove(location) != nil { plugs[location] = nil }
+            else { plugs[location]?.state = .captureRefused("Not connected: \(USBChoice.clean(why))") }
+            if let replacement = replacementCaptures.removeValue(forKey: location), !stopped { plugged(replacement) }
+        }
         changed()
     }
 

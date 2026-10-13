@@ -1,8 +1,10 @@
 # USB devices in OmacVM.app (experimental, off by default)
 
-A VM can have a USB device of the Mac, but only one that macOS doesn't use
-itself. That is a macOS rule, not an OmacVM one. This page says how it works,
-which devices work and which don't, and why.
+Ordinary USB passthrough uses unprivileged QEMU `usb-host` for devices macOS
+does not use. A separate, deliberately narrow **vendor HID** route is available
+from the **same USB Devices list**, only after explicit Connect and macOS
+administrator approval. QEMU and the app remain unprivileged. This is not a
+separate device-specific panel, CLI, automatic replug profile or general HID forwarding feature.
 
 ## Turn it on
 
@@ -43,7 +45,78 @@ While the VM runs, plug in a device. OmacVM asks:
 Two identical boards with serial numbers each get their own entry. A device
 without a serial number has one entry for all of them.
 
-## While the VM runs
+## Vendor HID: explicit Connect in the same list
+
+The app reads the registry without opening USB. A preliminary candidate must
+have one known non-boot HID interface and a bounded vendor-only report from
+the registry. **Class 3 alone is not safe**. Unknown reports, keyboards, mice,
+FIDO/security devices and composite devices remain unavailable. This preliminary
+check is not authorization: the native helper independently validates the
+selected physical generation, topology and report before and after capture.
+
+A candidate appears under Plugged in now (or its existing remembered row),
+with **Connect** and an administrator-approval explanation. Connect is accepted
+only while the app/VM is in front. Ordinary Always/remembered choices cannot
+start root capture; the picker is hidden for a plugged-in vendor HID. Every
+new physical plug requires another explicit Connect, even at the same port
+with the same VID/PID. Switching windows does **not** cancel an active capture.
+
+The UI distinguishes authorizing, capturing, connected, releasing, refused and
+unknown ownership. Disconnect is cancellation, not immediate proof that the
+Mac has the device. Native release, helper reap, owned-QMP removal and same-mode
+HID restoration are separate checks. Unplugged cleanup attempts remain visible
+as tombstones until resolved. Unknown ownership is quarantined, not shown as
+“on the Mac” and not eligible for another automatic capture.
+
+### Installation and trust boundary
+
+The bundle contains `Contents/Library/LaunchServices/omacvm-usb-helper`, a native
+executable with non-system USB dependencies linked statically. On explicit
+Connect the app uses the standard macOS administrator prompt. An inline,
+strictly quoted bootstrap installs a root-owned staging copy, verifies its
+SHA-256 **after copying**, and places it at:
+
+`/Library/PrivilegedHelperTools/org.omacvm.usb/releases/<sha256>/omacvm-usb-helper`
+
+Only that protected installed executable is run as root. There is no root
+execution of a user-writable script/Python payload, passwordless sudo, root
+QEMU, SIP change or Apple Developer signing requirement. Existing versions and
+separately installed workarounds are not removed by this path. Invalid or
+unprotected paths/hash mismatches fail closed. Interrupted staging may leave
+a root-owned staging directory; no blind recursive cleanup is performed.
+
+**The administrator trusts this local app and account.** Hashes prove staged
+byte identity, not publisher identity or resistance to malicious code running
+as the same UID. Protected paths and native PID/UID/start/exec-generation peer
+checks prevent accidental reuse and cross-account capture; they do not claim
+a hostile-same-user security boundary.
+
+### Native v1 and readiness
+
+`app/usb-helper/PROTOCOL.md` documents the control protocol. The app sends a
+bounded newline-delimited capture request with raw (unshortened) serial and
+registry-entry generation, separate from display labels, and an exact QEMU
+process identity. Native `listening` permits QMP creation but is **not Connected**.
+Connected requires native `postcheck`, successfully owned usb-redir frontend
+and backend, correct QOM type/chardev binding, typed frontend `attached` and
+backend `connected`. It does not prove a guest application can read the device.
+
+Each QMP command uses a short authenticated connection on the existing monitor;
+no second monitor or transport reconnect is required. Socket-client
+`chardev-add` omits `wait` and explicitly disables reconnect. CREATE success
+grants ownership, a matched rejection grants none, and ambiguous delivery is
+quarantined: unknown/foreign objects are never deleted. Native release and
+process reap precede app-owned QMP cleanup. Exact old PID ESRCH may retire
+ownership after native release without contacting a replacement monitor.
+
+Startup/authorization budgets are separate from transport life. There is no
+active transport time/frame-total cutoff. App control EOF, explicit cancel,
+physical removal or QEMU death asks the native helper to release. A helper
+exit or socket EOF alone is not proof of release. Unresolved attempts are
+retained in the app process; after an app crash, orphan QMP state must not be
+automatically deleted by a new app based only on matching object names.
+
+## While ordinary USB runs
 
 - A device you connect belongs to the VM until you unplug it or the VM stops.
   Then the Mac has it again. A restart inside Linux keeps it connected.
@@ -96,10 +169,10 @@ works only if macOS uses none of its parts.
 QEMU takes a device through libusb. On macOS, libusb can only use a part of
 a device that no macOS driver or app has open. Taking a part away from
 macOS needs Apple's `com.apple.vm.device-access` entitlement (or running
-QEMU as root, which OmacVM never does). Apple gives that entitlement to a
-developer team on request; UTM, VMware Fusion and Parallels have it.
-OmacVM does not have it yet. With it, the list could offer security keys,
-disks and serial adapters too.
+a narrow native helper as root). OmacVM never runs QEMU as root. Apple gives
+that entitlement to a developer team on request; this vendor-HID route does
+not require it. Security keys, disks and serial adapters remain refused by
+this helper regardless of whether a driver could technically be detached.
 
 Until then, other ways work for some of these:
 
@@ -120,7 +193,9 @@ Until then, other ways work for some of these:
   would plug into that Linux machine.
 - The app reads macOS's device list to see what is plugged in; it opens no
   device itself.
-- Only a device nothing on the Mac uses can be connected.
+- Ordinary `usb-host` connects only a device nothing on the Mac uses. The
+  separate vendor-HID helper route requires explicit administrator consent and
+  independent descriptor validation; it is not a blanket HID exemption.
 - If macOS or a Mac app has a device, QEMU leaves it alone: no reset (on
   macOS a reset reconnects the device, which would pull a mounted disk)
   (patch `qemu-usb-host-busy-device.patch`).
@@ -129,6 +204,35 @@ Until then, other ways work for some of these:
   stops.
 
 ## How it was tested
+
+New vendor-HID code has offline lifecycle/consent/parser/QMP-ownership tests,
+ordinary-user socketpair peer/framing/EOF fixtures, an ordinary process-launch
+fixture, and shell/AppleScript **compilation only** checks. Run:
+
+```sh
+(cd app/app && swift run -j 4 usb-tests --offline)
+python3 app/app/Sources/usb-tests/composition.py
+python3 src/tests/qmp-values.py
+python3 src/tests/usb-bootstrap-contract.py
+python3 src/tests/usb-helper-bundle.py
+python3 app/usb-helper/test.py --out app/.build/usb-helper-tests \
+  --cache app/.build/usb-helper-cache --download
+python3 app/runtime/Tests/usbredir/test-runtime.py
+python3 app/runtime/Tests/usbredir/test-ci.py
+src/tests/ci-app-build.sh
+```
+
+`--offline` refuses `--list`/`--qmp`, does not scan IORegistry, and never starts
+root authorization, USB capture or live QMP. Use an SDK compatible with your
+installed Swift toolchain. Build outputs and dependency caches are not source
+files; the build generates the LGPL sources and relinking materials for release.
+
+The privileged integration still requires separately authorized real admin
+allow/deny/cancel, packaged-helper install/update, GUI rendering, USB/guest
+read, unplug/replug, crash/VM-death cleanup and HID-restore acceptance. Offline
+passes do not prove those gates. This path does not replace other installed helpers.
+Firmware/calibration writes, mode switching, flash and sleep safety are not
+claimed by these tests. The following older results concern ordinary USB:
 
 - `swift run usb-tests` (in `app/app`, CI): which devices are free, taken from
   the IORegistry of a Mac mini (audio interface, iPhone, webcams, hubs,

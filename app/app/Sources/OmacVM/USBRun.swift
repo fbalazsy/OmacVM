@@ -75,7 +75,8 @@ final class USBRun: ObservableObject {
     private func begin() {
         let folder = config.folder
         let memory = USBMemory.load(folder: folder) { [weak self] in self?.log($0) }
-        let machine = USBQMPMachine(socketPath: config.qmpSocket.path, emulated: fake)
+        let ordinary = USBQMPMachine(socketPath: config.qmpSocket.path, emulated: fake)
+        let machine = USBPrivilegedMachine(ordinary: ordinary, socketPath: config.qmpSocket.path, qemuPID: pid)
         asker.qemuPID = { [pid] in pid }
         let s = USBSession(vmName: config.name, memory: memory, machine: machine, asker: asker, clock: MainClock(),
                            save: { [weak self] m in
@@ -103,6 +104,12 @@ final class USBRun: ObservableObject {
             self?.devices[loc] = nil
             self?.session?.unplugged(location: loc)
             self?.refreshRows()
+        }
+        watch.onUnplugExact = { [weak self] loc, registryID in
+            guard let self, self.devices[loc]?.registryID == registryID else { return }
+            self.devices[loc] = nil
+            self.session?.unplugged(location: loc)
+            self.refreshRows()
         }
         watch.start()
         if fake {
@@ -145,7 +152,12 @@ final class USBRun: ObservableObject {
 
     private func refreshRows() {
         guard let s = session else { return }
-        rows = USBListRows.make(memory: s.memory, devices: devices.values.sorted { $0.location < $1.location },
+        var visible = devices
+        // Retain cleanup tombstones after unplug; unknown ownership is never hidden.
+        for (location, plug) in s.plugs where plug.device.captureCandidate {
+            visible[location] = plug.device
+        }
+        rows = USBListRows.make(memory: s.memory, devices: visible.values.sorted { $0.location < $1.location },
                                 states: s.plugs.mapValues(\.state), vmName: config.name)
     }
 

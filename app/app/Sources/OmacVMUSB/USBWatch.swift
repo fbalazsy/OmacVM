@@ -10,6 +10,8 @@ import IOKit
 public final class USBWatch {
     public var onPlug: (USBDevice) -> Void = { _ in }
     public var onUnplug: (UInt32) -> Void = { _ in }
+    /// Exact generation callback; legacy callback remains for ordinary/test consumers.
+    public var onUnplugExact: ((UInt32, UInt64) -> Void)?
 
     private var port: IONotificationPortRef?
     private var added: io_iterator_t = 0
@@ -94,7 +96,7 @@ public final class USBWatch {
             if settling.contains(entry) {
                 leftEarly.insert(entry)
             } else if let loc = places.removeValue(forKey: entry) {
-                onUnplug(loc)
+                if let onUnplugExact { onUnplugExact(loc, entry) } else { onUnplug(loc) }
             }
         }
     }

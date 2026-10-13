@@ -54,6 +54,13 @@ public struct USBListRows: Equatable, Sendable {
             guard let states else { return ("Plugged in", false, false) }
             switch states[d.location] {
             case .connected?: return ("Connected to \(vmName)", false, true)
+            case .captureAvailable?: return ("Vendor HID · administrator approval required", true, false)
+            case .authorizing?: return ("Waiting for administrator approval…", false, true)
+            case .capturing?: return ("Capturing vendor HID…", false, true)
+            case .releasing?: return ("Releasing…", false, false)
+            case .uncertain(let why)?: return ("Ownership unknown: \(USBChoice.clean(why))", false, true)
+            case .captureEnded(let why)?: return (why, false, false)
+            case .captureRefused(let why)?: return (why, true, false)
             case .connecting?: return ("Connecting…", false, false)
             // Asking: answered in the question (Connect here would race it).
             case .asking?: return ("Plugged in, waiting for your answer", false, false)
@@ -62,7 +69,7 @@ public struct USBListRows: Equatable, Sendable {
             default: return ("Plugged in, on the Mac", true, false)
             }
         }
-        let free = devices.filter { $0.availability == .free }
+        let free = devices.filter { $0.availability == .free || $0.captureCandidate }
         for e in memory.devices {
             // The plugged-in device this entry is for (USBMemory.entry picks the entry per device).
             let d = free.first { !used.contains($0.location) && memory.entry(for: $0) == e }
@@ -83,7 +90,7 @@ public struct USBListRows: Equatable, Sendable {
                                    canConnect: running && c, canDisconnect: running && dis))
         }
         for d in devices {
-            if case .usedByMac(let why) = d.availability {
+            if case .usedByMac(let why) = d.availability, !d.captureCandidate {
                 out.kept.append(Kept(id: "kept-\(String(format: "%08x", d.location))-\(d.id)", name: d.displayName, why: why))
             }
         }

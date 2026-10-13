@@ -15,7 +15,7 @@ struct USBRow: View {
 
     private var folder: URL { state.config.folder }
 
-    static let explanation = "When it’s on and you plug in a device while the VM runs, OmacVM asks whether to connect it to the VM or keep it on the Mac. Your answer counts for that plug-in only, unless you check “Always do this for this device”. Devices… lists the remembered ones, to change or forget. macOS lets a VM have only devices it doesn’t use itself: debug probes, SDR sticks, logic analysers, phones in fastboot. Keyboards, security keys, USB disks, serial adapters, audio and cameras stay with the Mac and are never asked about."
+    static let explanation = "When it’s on and you plug in a device while the VM runs, OmacVM asks whether to connect it to the VM or keep it on the Mac. Your answer counts for that plug-in only, unless you check “Always do this for this device”. Devices… lists the remembered ones, to change or forget. Ordinary USB connects devices macOS doesn’t use: debug probes, SDR sticks, logic analysers, phones in fastboot. Supported vendor HID is offered in the same list only through explicit Connect and administrator approval for this plug and VM run; Always never authorizes it. Keyboards, security keys, USB disks, serial adapters, audio and cameras stay with the Mac and are never asked about."
 
     var body: some View {
         SettingRow(title: "USB devices", badge: "experimental",
@@ -78,7 +78,10 @@ final class USBListBefore: ObservableObject {
             for d in preview { devices[d.location] = d }
         } else {
             watch.onPlug = { [weak self] d in self?.devices[d.location] = d; self?.refresh() }
-            watch.onUnplug = { [weak self] loc in self?.devices[loc] = nil; self?.refresh() }
+            watch.onUnplugExact = { [weak self] loc, registryID in
+                guard let self, self.devices[loc]?.registryID == registryID else { return }
+                self.devices[loc] = nil; self.refresh()
+            }
             watch.start()
         }
         refresh()
@@ -166,6 +169,11 @@ struct USBDeviceList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if showsTitle { Text("USB Devices").font(.system(size: 15, weight: .semibold)) }
+            if (rows.plugged + rows.remembered).contains(where: { $0.device?.captureCandidate == true }) {
+                Text("Vendor HID: Connect authorizes this plug and VM run only. Administrator approval installs a native helper; you trust this local app/account. New plugs always require Connect. Keyboards and security devices are refused.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
                     if rows.isEmpty {
@@ -235,6 +243,7 @@ struct USBDeviceList: View {
     @ViewBuilder
     private func deviceRow(_ row: USBListRows.Row) -> some View {
         SettingRow(title: row.name, subtitle: [row.detail, row.status].filter { !$0.isEmpty }.joined(separator: " · ")) {
+            if row.device?.captureCandidate != true {
             Picker("When “\(row.name)” is plugged in", selection: planBinding(row)) {
                 Text("Ask Each Time").tag(USBPlan.ask)
                 Text("Connect to \(vmName)").tag(USBPlan.omarchy)
@@ -242,6 +251,7 @@ struct USBDeviceList: View {
             }
             .labelsHidden()
             .fixedSize()
+            }
             if row.canConnect && isRunning {
                 Button("Connect") { running.run?.connect(row) }
                     .accessibilityLabel("Connect \(row.name) to \(vmName)")

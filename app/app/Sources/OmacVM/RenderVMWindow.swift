@@ -363,6 +363,25 @@ enum RenderVMWindow {
                                        states: [0x0110_0000: .connected, 0x0120_0000: .onMac(remembered: false)], vmName: "Omarchy")
         sheet("sheet-6-usb-running") { USBDeviceList(source: .picture(running, running: true), vmName: "Omarchy", showsTitle: false) {} }
         sheet("sheet-7-usb-empty") { USBDeviceList(source: .picture(USBListRows(), running: false), vmName: "Omarchy") {} }
+        // Inert vendor-HID fixture: the real existing list, never a hardware scan
+        // or privileged operation. Verify each lifecycle layout in both appearances.
+        let vendor = USBDevice(id: .init(vendor: 0x1234, product: 0x5678), name: "Vendor bootloader", deviceClass: 0,
+            interfaces: [.init(number: 0, interfaceClass: 3, users: ["IOHIDDevice"], interfaceSubclass: 0,
+                interfaceProtocol: 0, reportDescriptor: Data([0x06, 0x00, 0xff, 0x09, 1, 0xa1, 1, 0x75, 8, 0x95, 8, 0x09, 1, 0x81, 2, 0xc0]))],
+            serial: "fixture", location: 0x0150_0000, address: 7, registryID: 99, rawSerial: "fixture")
+        for (name, status, connect, disconnect) in [
+            ("available", USBSession.State.captureAvailable, true, false),
+            ("authorizing", .authorizing, false, true),
+            ("connected", .connected, false, true),
+            ("releasing", .releasing, false, false),
+            ("uncertain", .uncertain("Native release not proven"), false, true),
+        ] {
+            let rows = USBListRows.make(memory: USBMemory(), devices: [vendor, usbDevices[2]],
+                                       states: [vendor.location: status], vmName: "Omarchy")
+            let row = rows.plugged.first
+            note("vendor-hid-\(name): action state", fail: row?.canConnect != connect || row?.canDisconnect != disconnect || rows.kept.count != 1)
+            sheet("sheet-usb-hid-\(name)") { USBDeviceList(source: .picture(rows, running: true), vmName: "Omarchy") {} }
+        }
         // The question, as USBAlertAsker shows it (light and dark).
         let q = USBQuestion(device: usbDevices[0], vmName: "Omarchy", waiting: 0)
         for dark in [false, true] {
