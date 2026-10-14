@@ -365,7 +365,24 @@ enum RenderVMWindow {
         ]
     }()
 
-    private static func usbPictures(folder: URL, into dir: URL) {
+    /// Synthetic vendor HID, decoded by the same read-only scan as real rows.
+    static let usbVendorDevice: USBDevice = {
+        let hid = USBScan.Entry(registryID: 99, className: "IOHIDDevice", properties: [
+            "VendorID": 0x1209, "ProductID": 7, "SerialNumber": "fixture-boot", "Product": "Vendor Bootloader", "Transport": "USB",
+            "PrimaryUsagePage": 65280, "PrimaryUsage": 1,
+            "DeviceUsagePairs": [["DeviceUsagePage": 65280, "DeviceUsage": 1]],
+            "ReportDescriptor": Data([0x06, 0, 0xff, 0x09, 1, 0xa1, 1, 0x75, 8, 0x95, 60, 0x81, 2, 0x91, 2, 0xc0]),
+        ])
+        let interface = USBScan.Entry(registryID: 98, className: "IOUSBHostInterface", properties: [
+            "bInterfaceNumber": 0, "bInterfaceClass": 3, "bInterfaceSubClass": 0, "bInterfaceProtocol": 0,
+        ], children: [hid])
+        return USBScan.device(USBScan.Entry(registryID: 97, className: "IOUSBHostDevice", properties: [
+            "idVendor": 0x1209, "idProduct": 7, "USB Product Name": "Vendor Bootloader", "USB Serial Number": "fixture-boot",
+            "locationID": 0x01500000, "USB Address": 7,
+        ], children: [interface]))!
+    }()
+
+    static func usbPictures(folder: URL, into dir: URL) {
         let memory = USBMemory(devices: [
             .init(vendor: "0483", product: "3748", name: "STM32 STLink", maker: "STMicroelectronics", choice: .omarchy, since: "2026-10-07"),
             .init(vendor: "1d50", product: "6089", name: "HackRF One", maker: "Great Scott Gadgets", choice: .mac, since: "2026-10-07"),
@@ -376,6 +393,16 @@ enum RenderVMWindow {
                                        states: [0x0110_0000: .connected, 0x0120_0000: .onMac(remembered: false)], vmName: "Omarchy")
         sheet("sheet-6-usb-running") { USBDeviceList(source: .picture(running, running: true), vmName: "Omarchy", showsTitle: false) {} }
         sheet("sheet-7-usb-empty") { USBDeviceList(source: .picture(USBListRows(), running: false), vmName: "Omarchy") {} }
+        let boot = usbVendorDevice
+        let startup = USBListRows.make(memory: USBMemory(), devices: [boot] + usbDevices, states: nil, vmName: "Omarchy")
+        sheet("usb-hid-startup") { USBDeviceList(source: .picture(startup, running: false), vmName: "Omarchy") {} }
+        var hidMemory = USBMemory()
+        hidMemory.remember(boot, .omarchy)
+        for (name, state) in [("connected", USBSession.State.connected), ("on-mac", .onMac(remembered: false)),
+                              ("disconnecting", .disconnecting), ("release-failed", .releaseFailed)] {
+            let rows = USBListRows.make(memory: hidMemory, devices: [boot], states: [boot.location: state], vmName: "Omarchy")
+            sheet("usb-hid-\(name)") { USBDeviceList(source: .picture(rows, running: true), vmName: "Omarchy") {} }
+        }
         // The question, as USBAlertAsker shows it (light and dark).
         let q = USBQuestion(device: usbDevices[0], vmName: "Omarchy", waiting: 0)
         for dark in [false, true] {

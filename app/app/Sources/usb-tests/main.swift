@@ -7,6 +7,12 @@
 import Foundation
 import OmacVMUSB
 
+let offline = CommandLine.arguments.contains("--offline")
+if offline && (CommandLine.arguments.contains("--list") || CommandLine.arguments.contains("--qmp")) {
+    print("--offline cannot be combined with --list or --qmp")
+    exit(2)
+}
+
 if CommandLine.arguments.contains("--list") {
     for d in USBScan.devices() {
         let a: String
@@ -206,7 +212,12 @@ final class FakeQMP: USBQMPTransport {
         sent.append(command)
         switch command {
         case "device_add":
-            if let e = addFails { throw NSError(domain: "qmp", code: 1, userInfo: [NSLocalizedDescriptionKey: e]) }
+            if let e = addFails {
+                if arguments?["driver"] as? String == "usb-host-hid" {
+                    throw QMPCommandRejection(command: "device_add", errorClass: "GenericError", detail: e)
+                }
+                throw NSError(domain: "qmp", code: 1, userInfo: [NSLocalizedDescriptionKey: e])
+            }
             if takes { attached.insert(arguments?["id"] as? String ?? "") }
             return [:]
         case "device_del":
@@ -530,14 +541,25 @@ do {
     expect(rows.remembered.count == 1 && rows.plugged.count == 1 && rows.plugged[0].plan == .omarchy,
            "10: two boards without a serial: the second shows the choice they share")
 }
+scopeDecoderTests()
+scopeWatchTests()
+scopePersistenceTests()
+scopeAdmissionTests()
+rootlessHIDTests()
+independentReviewTests()
+appReviewFixTests()
+ownershipOutcomeTests()
+ownershipRaceTests()
 try? FileManager.default.removeItem(at: tmp)
 
 if let i = CommandLine.arguments.firstIndex(of: "--qmp"), i + 1 < CommandLine.arguments.count {
     qmpIntegration(qemu: CommandLine.arguments[i + 1], expect: { expect($0, $1) })
 }
 // The scan only reads the IORegistry; on any Mac it returns without opening anything.
-_ = USBScan.devices()
-expect(true, "the IORegistry scan runs")
+if !offline {
+    _ = USBScan.devices()
+    expect(true, "the IORegistry scan runs")
+}
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

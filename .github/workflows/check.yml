@@ -92,6 +92,15 @@ jobs:
       - name: Update parts cover src/
         run: python3 src/release/manifest.py parts > /dev/null
 
+      - name: Rootless HID recipe and runner (offline)
+        run: |
+          python3 app/runtime/Tests/test-rootless-hid-recipe.py -v
+          python3 app/runtime/Tests/test-hid-policy-runner.py -v
+
+      - name: Rootless HID native dispatch (no hardware)
+        run: |
+          python3 app/runtime/Tests/test-hid-native-dispatch.py --output "$JOB_TMP/hid-native-dispatch"
+
       - name: Boot splash and start animation (offline, from the patch)
         run: app/runtime/Tests/display/check-boot-splash.sh
 
@@ -552,10 +561,35 @@ jobs:
       - name: OmacVM.app builds (build-app.sh, not a release)
         run: |
           start=$(date +%s)
-          app/scripts/build-app.sh --name "$APP_NAME" --id "$APP_ID" 2>&1 | tee "$JOB_TMP/build.log"
+          OMACVM_RUNTIME_KEEP_WORK=1 app/scripts/build-app.sh --name "$APP_NAME" --id "$APP_ID" 2>&1 | tee "$JOB_TMP/build.log"
           echo "build-app.sh took $(( $(date +%s) - start )) s"
           # The runtime's build tests, when it was built from source.
           if grep -nw FAIL "$JOB_TMP/build.log"; then echo "::error::a runtime build test failed"; exit 1; fi
+
+      - name: Rootless HID shared corpus (fresh runtime only)
+        id: hid_policy
+        run: |
+          # KEEP_WORK preserves the existing build tree until this job's cleanup.
+          # The runtime cache carries no source/objects: a hit is an explicit skip.
+          work=$(sed -n 's/^\[qemu-source-build\] kept work dir: //p' "$JOB_TMP/build.log")
+          if [[ -z $work ]]; then
+            if grep -q '^\[qemu-source-build\]' "$JOB_TMP/build.log"; then
+              echo '::error::fresh runtime build did not retain its source tree'; exit 1
+            fi
+            echo 'SKIP compiled HID corpus: cached runtime has no source build tree'
+          else
+            builds=("$work"/source/qemu-*/build)
+            ninjas=("$work"/tools/ninja-*.data/scripts/ninja)
+            [[ ${#builds[@]} == 1 && -f ${builds[0]}/compile_commands.json &&
+               ${#ninjas[@]} == 1 && -x ${ninjas[0]} ]] || {
+              echo '::error::missing or ambiguous retained QEMU build/Ninja'; exit 1;
+            }
+            python3 app/runtime/Tests/hid-policy/run.py \
+              --qemu-build "${builds[0]}" --ninja "${ninjas[0]}" \
+              --runtime app/runtime/.build/qemu-gpu-runtime \
+              --swift-source app/app/Sources/OmacVMUSB \
+              --output "$JOB_TMP/hid-policy" --sdk "${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+          fi
 
       - name: The app is complete (commit, id, version, signature, its parts)
         run: |
@@ -581,8 +615,8 @@ jobs:
           du -sh "$app"
           exit $fail
 
-      - name: Keep the runtime for the next run (also when the app part failed)
-        if: ${{ !cancelled() }}
+      - name: Keep the runtime for the next run (only after the HID gate)
+        if: ${{ !cancelled() && steps.hid_policy.outcome == 'success' }}
         run: |
           if grep -qw FAIL "$JOB_TMP/build.log" 2>/dev/null; then echo "skip (a runtime build test failed)"
           else .github/app-runtime-cache.sh save app/runtime/.build; fi

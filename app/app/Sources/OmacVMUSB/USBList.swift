@@ -55,6 +55,8 @@ public struct USBListRows: Equatable, Sendable {
             switch states[d.location] {
             case .connected?: return ("Connected to \(vmName)", false, true)
             case .connecting?: return ("Connecting…", false, false)
+            case .disconnecting?: return ("Disconnecting…", false, false)
+            case .releaseFailed?: return ("QEMU did not confirm release; retry Disconnect", false, true)
             // Asking: answered in the question (Connect here would race it).
             case .asking?: return ("Plugged in, waiting for your answer", false, false)
             case .waiting?: return ("Plugged in, waiting for your answer", true, false)

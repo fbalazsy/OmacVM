@@ -9,7 +9,9 @@ import IOKit
 // OmacVM has not got it) or root. So the app offers only devices nothing on
 // the Mac uses (debug probes, SDR sticks, logic analysers, phones in
 // fastboot/ADB, ...), and says why the others (keyboards, security keys,
-// storage, serial adapters, audio, cameras) stay with the Mac.
+// storage, serial adapters, audio, cameras) stay with the Mac. Bounded,
+// single-interface vendor HID instead uses ordinary-user IOHID reports through
+// usb-host-hid; its exact live identity and descriptor are checked again by QEMU.
 
 /// A device's vendor and product (with its serial number, what the remembered
 /// choices match: USBMemory).
@@ -71,6 +73,9 @@ public struct USBDevice: Equatable, Sendable {
     public var location: UInt32
     /// Its address on that bus ("USB Address"; libusb's device address on macOS).
     public var address: Int
+    /// Exact live IOHIDDevice generation; never a USB parent or location ID.
+    public var hid: USBHID? = nil
+    public var hidUnavailable: String? = nil
 
     public init(id: USBDeviceID, name: String, deviceClass: Int, drivers: [String] = [], interfaces: [Interface],
                 serial: String = "", maker: String = "", location: UInt32 = 0, address: Int = 0) {
@@ -113,6 +118,8 @@ public struct USBDevice: Equatable, Sendable {
         if deviceClass == 0x11 || interfaces.contains(where: { $0.interfaceClass == 0x11 }) {
             return .notOffered("a USB-C adapter's info device")
         }
+        if let why = hidUnavailable { return .usedByMac(why) }
+        if hid != nil { return .free }
         let users = drivers + interfaces.flatMap(\.users)
         if let u = users.first { return .usedByMac(USBDevice.reason(u)) }
         return .free
@@ -241,6 +248,16 @@ public enum USBScan {
     }
 
     public static func device(_ dev: io_registry_entry_t) -> USBDevice? {
+        guard var d = ordinaryDevice(dev) else { return nil }
+        // Ordinary decoding is always shallow and retains its original result.
+        if d.interfaces.count == 1, d.interfaces[0].interfaceClass == 3 {
+            var budget = 128
+            d.hid = USBHID.resolve(readEntry(dev, depth: 0, budget: &budget))
+        }
+        return d
+    }
+
+    private static func ordinaryDevice(_ dev: io_registry_entry_t) -> USBDevice? {
         guard let v = int(dev, "idVendor"), let p = int(dev, "idProduct") else { return nil }
         let id = USBDeviceID(vendor: UInt16(truncatingIfNeeded: v), product: UInt16(truncatingIfNeeded: p))
         let name = string(dev, "USB Product Name") ?? string(dev, "kUSBProductString") ?? registryName(dev)
@@ -286,6 +303,34 @@ public enum USBScan {
         var out: [io_registry_entry_t] = []
         while case let c = IOIteratorNext(it), c != 0 { out.append(c) }
         return out
+    }
+
+    /// Snapshot counterpart of the vanilla shallow decoder, for offline fixtures.
+    public static func device(_ dev: Entry) -> USBDevice? {
+        guard let v = dev.number("idVendor"), let p = dev.number("idProduct") else { return nil }
+        let vendor = UInt16(truncatingIfNeeded: v), product = UInt16(truncatingIfNeeded: p)
+        func string(_ key: String) -> String? { dev.string(key).flatMap { $0.isEmpty ? nil : $0 } }
+        var drivers: [String] = []
+        var interfaces: [USBDevice.Interface] = []
+        for child in dev.children {
+            if child.className == "IOUSBHostInterface" {
+                interfaces.append(.init(number: child.number("bInterfaceNumber") ?? interfaces.count,
+                                        interfaceClass: child.number("bInterfaceClass") ?? 0,
+                                        users: child.children.map(\.user)))
+            } else if !USBDevice.ignoredDeviceChild(className: child.className) {
+                drivers.append(child.user)
+            }
+        }
+        var d = USBDevice(id: .init(vendor: vendor, product: product),
+                          name: string("USB Product Name") ?? string("kUSBProductString") ?? dev.name,
+                          deviceClass: dev.number("bDeviceClass") ?? 0, drivers: drivers,
+                          interfaces: interfaces.sorted { $0.number < $1.number },
+                          serial: USBChoice.clean(string("USB Serial Number") ?? string("kUSBSerialNumberString") ?? ""),
+                          maker: USBChoice.clean(string("USB Vendor Name") ?? string("kUSBVendorString") ?? ""),
+                          location: UInt32(truncatingIfNeeded: dev.number("locationID") ?? 0),
+                          address: dev.number("USB Address") ?? 0)
+        if d.interfaces.count == 1, d.interfaces[0].interfaceClass == 3 { d.hid = USBHID.resolve(dev) }
+        return d
     }
 
     static func className(_ e: io_registry_entry_t) -> String {

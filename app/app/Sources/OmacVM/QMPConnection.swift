@@ -1,6 +1,7 @@
 // From try-omarchy (github.com/omacom/try-omarchy), MIT, (c) Try Omarchy contributors.
 import Darwin
 import Foundation
+import OmacVMUSB
 
 /// One authenticated connection to QEMU's private machine-protocol socket.
 ///
@@ -74,11 +75,13 @@ final class QMPConnection: @unchecked Sendable {
     func execute(
         _ command: String,
         arguments: [String: Any]? = nil,
+        strictMutation: Bool = false,
         timeoutMilliseconds: Int32 = 2_000
     ) throws -> [String: Any] {
         try executeCapturingEvents(
             command,
             arguments: arguments,
+            strictMutation: strictMutation,
             timeoutMilliseconds: timeoutMilliseconds
         ).result
     }
@@ -86,10 +89,13 @@ final class QMPConnection: @unchecked Sendable {
     func executeCapturingEvents(
         _ command: String,
         arguments: [String: Any]? = nil,
+        strictMutation: Bool = false,
         timeoutMilliseconds: Int32 = 2_000
     ) throws -> CommandExecution {
         try queue.sync { [self] in
+            let hidMutation = strictMutation || (command == "device_add" && arguments?["driver"] as? String == "usb-host-hid")
             guard !closed else {
+                if hidMutation { throw QMPCommandNotSent("QMP control is unavailable") }
                 throw HelperError.io("QMP control is unavailable")
             }
             let identifier = nextCommandIdentifier()
@@ -110,12 +116,27 @@ final class QMPConnection: @unchecked Sendable {
                     throw HelperError.io("QMP command \(command) timed out")
                 }
                 let response = matched.object
-                if let error = response["error"] as? [String: Any] {
-                    let detail = error["desc"] as? String ?? "unknown QMP error"
-                    throw HelperError.io("QMP command \(command) failed: \(detail)")
+                if hidMutation {
+                    guard response["event"] == nil else {
+                        throw HelperError.io("QMP command \(command) returned a contradictory response")
+                    }
+                    if response["error"] != nil {
+                        guard response["return"] == nil,
+                              let error = response["error"] as? [String: Any],
+                              let kind = error["class"] as? String, !kind.isEmpty,
+                              let detail = error["desc"] as? String else {
+                            throw HelperError.io("QMP command \(command) returned an invalid error")
+                        }
+                        throw QMPCommandRejection(command: command, errorClass: kind, detail: detail)
+                    }
+                } else {
+                    if let error = response["error"] as? [String: Any] {
+                        let detail = error["desc"] as? String ?? "unknown QMP error"
+                        throw HelperError.io("QMP command \(command) failed: \(detail)")
+                    }
                 }
                 // human-monitor-command answers with text: kept under "text".
-                if let text = response["return"] as? String {
+                if !strictMutation, let text = response["return"] as? String {
                     return CommandExecution(result: ["text": text], events: matched.events)
                 }
                 guard let result = response["return"] as? [String: Any] else {

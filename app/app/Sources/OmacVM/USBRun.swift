@@ -33,7 +33,6 @@ final class USBRun: ObservableObject {
 
     /// What the list shows (USBDeviceList).
     @Published private(set) var rows = USBListRows()
-    private var devices: [UInt32: USBDevice] = [:]
 
     init(config: VMConfig, qemuPID: pid_t, log: @escaping (String) -> Void) {
         self.config = config
@@ -95,12 +94,10 @@ final class USBRun: ObservableObject {
             }
         })
         watch.onPlug = { [weak self] d in
-            self?.devices[d.location] = d
             self?.session?.plugged(d)
             self?.refreshRows()
         }
         watch.onUnplug = { [weak self] loc in
-            self?.devices[loc] = nil
             self?.session?.unplugged(location: loc)
             self?.refreshRows()
         }
@@ -145,8 +142,7 @@ final class USBRun: ObservableObject {
 
     private func refreshRows() {
         guard let s = session else { return }
-        rows = USBListRows.make(memory: s.memory, devices: devices.values.sorted { $0.location < $1.location },
-                                states: s.plugs.mapValues(\.state), vmName: config.name)
+        rows = s.rows
     }
 
     // MARK: The list while the VM runs
@@ -209,14 +205,23 @@ struct USBQMPSocket: USBQMPTransport {
     let path: String
     /// Test builds (OMACVM_TEST_USB_FAKE): usb-host becomes QEMU's emulated tablet, same id and bus.
     var emulated = false
+    // Only target cleanup opts into strict mutation envelopes; ordinary QMP is unchanged.
+    var confirmDelete = false
     func execute(_ command: String, _ arguments: [String: Any]?) throws -> [String: Any] {
         var args = arguments
         if emulated, command == "device_add", args?["driver"] as? String == "usb-host" {
             args = ["driver": "usb-tablet", "id": args?["id"] ?? "", "bus": args?["bus"] ?? ""]
         }
-        let q = try QMPConnection(socketPath: path, identifierPrefix: "omacvm-usb")
+        let q: QMPConnection
+        do { q = try QMPConnection(socketPath: path, identifierPrefix: "omacvm-usb") }
+        catch {
+            if command == "device_add", args?["driver"] as? String == "usb-host-hid" {
+                throw QMPCommandNotSent(error.localizedDescription)
+            }
+            throw error
+        }
         defer { q.close() }
-        return try q.execute(command, arguments: args, timeoutMilliseconds: 3_000)
+        return try q.execute(command, arguments: args, strictMutation: confirmDelete && command == "device_del", timeoutMilliseconds: 3_000)
     }
 }
 
@@ -230,6 +235,8 @@ final class USBQMPMachine: USBMachine {
 
     func attach(_ device: USBDevice, done: @escaping (USBAttachResult) -> Void) {
         queue.async { [qmp] in
+            var qmp = qmp
+            qmp.confirmDelete = device.hid != nil
             let r = USBQMP.attach(device, over: qmp)
             DispatchQueue.main.async { done(r) }
         }
@@ -237,7 +244,9 @@ final class USBQMPMachine: USBMachine {
 
     func detach(_ device: USBDevice, done: @escaping (Bool) -> Void) {
         queue.async { [qmp] in
-            let r = USBQMP.detach(location: device.location, over: qmp)
+            var qmp = qmp
+            qmp.confirmDelete = device.hid != nil
+            let r = USBQMP.detach(location: device.location, over: qmp, confirmDelete: device.hid != nil)
             DispatchQueue.main.async { done(r) }
         }
     }

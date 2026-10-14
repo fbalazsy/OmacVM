@@ -1,0 +1,2247 @@
+--- /dev/null
++++ b/hw/usb/dev-host-hid.c
+@@ -0,0 +1,705 @@
++/* Rootless report-level USB HID device. SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "hw/usb/usb.h"
++#include "hw/usb/desc.h"
++#include "hw/core/qdev-properties.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "migration/vmstate.h"
++#include "qemu/main-loop.h"
++#include <IOKit/IOKitLib.h>
++#include <IOKit/hid/IOHIDDevice.h>
++#include <dispatch/dispatch.h>
++#define TYPE_HOST_HID "usb-host-hid"
++OBJECT_DECLARE_SIMPLE_TYPE(HostHIDState, HOST_HID)
++struct HostHIDState {
++    USBDevice parent_obj;
++    uint64_t registry_id;
++    uint16_t vendorid, productid;
++    char *product;
++    uint8_t report_desc[1024];
++    size_t report_desc_len;
++    uint16_t sizes[3][256];
++    bool numbered;
++    QemuMutex lock;
++    QEMUBH *bh;
++    bool live, busy, done, closing;
++    bool configured, halted[2];
++    unsigned epoch, transfer_epoch;
++    int result;
++    USBPacket *pending, *waiting;
++    bool transfer_set;
++    unsigned transfer_id, transfer_len, guest_len;
++    uint8_t transfer[64];
++    struct { uint8_t data[64]; unsigned len; } queue[16];
++    unsigned head, count;
++    IOHIDDeviceRef hid;
++    dispatch_queue_t dispatch;
++    dispatch_semaphore_t cancelled;
++    uint8_t input[64];
++    USBDesc desc;
++    USBDescDevice device;
++    USBDescConfig config;
++    USBDescIface iface;
++    USBDescOther other;
++    USBDescEndpoint eps[2];
++    const char *strings[256];
++    uint8_t hid_desc[9];
++};
++static bool native_open(HostHIDState *s, Error **errp);
++static void native_close(HostHIDState *s);
++static void native_start(HostHIDState *s);
++static void host_hid_abort(HostHIDState *s);
++static void host_hid_resume(HostHIDState *s);
++static int native_report(HostHIDState *s, bool set, unsigned type,
++                         unsigned id, uint8_t *data, unsigned len);
++/* Callback side: never touches USB state and never takes the BQL. */
++static void host_hid_receive(HostHIDState *s, unsigned id, const uint8_t *data, size_t len)
++{
++    qemu_mutex_lock(&s->lock);
++    if (!s->closing && s->live && s->configured) {
++        if (id > 255 || !len || len > 64 || len != s->sizes[0][id] ||
++            (!!id != s->numbered) || (id && data[0] != id) || s->count == 16) {
++            s->live = false; /* Never silently lose a transaction. */
++        } else {
++            unsigned slot = (s->head + s->count++) % 16;
++            memcpy(s->queue[slot].data, data, len);
++            s->queue[slot].len = len;
++        }
++        qemu_bh_schedule(s->bh);
++    }
++    qemu_mutex_unlock(&s->lock);
++}
++static void host_hid_complete(HostHIDState *s, int result)
++{
++    qemu_mutex_lock(&s->lock);
++    if (!s->closing) {
++        s->result = result;
++        s->done = true;
++        qemu_bh_schedule(s->bh);
++    }
++    qemu_mutex_unlock(&s->lock);
++}
++static void host_hid_bh(void *opaque)
++{
++    HostHIDState *s = opaque;
++    USBDevice *dev = USB_DEVICE(s);
++    qemu_mutex_lock(&s->lock);
++    bool live = s->live;
++    if (s->done) {
++        USBPacket *p = s->pending;
++        s->pending = NULL;
++        s->done = s->busy = false;
++        if (p) {
++            bool ok = live && s->transfer_epoch == s->epoch && s->result == s->transfer_len &&
++                (!s->transfer_id || s->transfer[0] == s->transfer_id);
++            p->status = ok ? USB_RET_SUCCESS : USB_RET_STALL;
++            p->actual_length = ok ? MIN(s->guest_len, s->transfer_len) : 0;
++            if (!s->transfer_set && ok) {
++                memcpy(dev->data_buf, s->transfer, p->actual_length);
++            }
++            qemu_mutex_unlock(&s->lock);
++            if (p->ep->nr == 0) { usb_generic_async_ctrl_complete(dev, p); }
++            else { usb_packet_complete(dev, p); }
++            qemu_mutex_lock(&s->lock);
++        }
++    }
++    bool wake = s->count != 0;
++    qemu_mutex_unlock(&s->lock);
++    if (!live && dev->attached) { host_hid_abort(s); usb_device_detach(dev); }
++    else if (live) {
++        host_hid_resume(s);
++        if (wake) { usb_wakeup(usb_ep_get(dev, USB_TOKEN_IN, 1), 0); }
++    }
++}
++/* Bounded grammar and layout; optional top-level usage is page << 16 | usage. */
++static bool host_hid_parse(HostHIDState *s, uint32_t *application)
++{
++    unsigned page = 0, size = 0, count = 0, id = 0, depth = 0, apps = 0;
++    uint32_t local_usage = 0;
++    bool zero = false;
++    memset(s->sizes, 0, sizeof(s->sizes));
++    s->numbered = false;
++    for (size_t p = 0; p < s->report_desc_len;) {
++        uint8_t tag = s->report_desc[p++];
++        unsigned n = (tag & 3) == 3 ? 4 : tag & 3, v = 0;
++        if (tag == 0xfe || n > s->report_desc_len - p) { return false; }
++        for (unsigned i = 0; i < n; i++) { v |= (uint32_t)s->report_desc[p++] << (8 * i); }
++        switch (tag & 0xfc) {
++        case 0x04: page = v; if (page < 0xff00 || page > 0xffff) { return false; } break;
++        case 0x74: size = v; break;
++        case 0x94: count = v; break;
++        case 0x84:
++            if (!v || v > 255 || zero) { return false; }
++            id = v; s->numbered = true; break;
++        case 0xa0:
++            if (page < 0xff00 || (!depth && (v != 1 || ++apps != 1)) ||
++                depth >= 8) { return false; }
++            if (!depth && application) { *application = local_usage; }
++            depth++; break;
++        case 0xc0: if (!depth || n) { return false; } depth--; break;
++        case 0x80: case 0x90: case 0xb0: {
++            unsigned t = (tag & 0xfc) == 0x80 ? 0 : (tag & 0xfc) == 0x90 ? 1 : 2;
++            if (!depth || !size || size > 32 || !count || count > 512 ||
++                size * count > 512 || s->sizes[t][id] + size * count > (id ? 504 : 512)) { return false; }
++            if (!id) { zero = true; if (s->numbered) { return false; } }
++            s->sizes[t][id] += size * count;
++            break;
++        }
++        case 0x08: case 0x18: case 0x28:
++            if (n == 4 && (v >> 16) < 0xff00) { return false; }
++            if ((tag & 0xfc) == 0x08) { local_usage = n == 4 ? v : (page << 16) | (v & 0xffff); }
++            break;
++        case 0x14: case 0x24: case 0x34: case 0x44: case 0x54: case 0x64:
++            break;
++        default: return false;
++        }
++    }
++    bool input = false;
++    for (unsigned t = 0; t < 3; t++) {
++        for (unsigned r = 0; r < 256; r++) {
++            if (s->sizes[t][r]) {
++                s->sizes[t][r] = (s->sizes[t][r] + 7) / 8 + !!r;
++                input |= t == 0;
++            }
++        }
++    }
++    return input && apps == 1 && depth == 0;
++}
++static int host_hid_report(HostHIDState *s, USBPacket *p, bool set, unsigned type,
++                           unsigned id, uint8_t *data, unsigned len)
++{
++    if (type < 1 || type > 3 || id > 255 || !s->sizes[type - 1][id] ||
++        (set && (type == 1 || len != s->sizes[type - 1][id] ||
++                 (id && data[0] != id)))) { return USB_RET_STALL; }
++    qemu_mutex_lock(&s->lock);
++    if (!s->live || s->busy) {
++        int r = s->live ? USB_RET_NAK : USB_RET_NODEV;
++        /* EP0 NAK loses ACK/parameter state in the generic core/controllers.
++         * Keep its core-owned setup/data buffers until the native slot drains. */
++        if (s->live && p->ep->nr == 0) { s->waiting = p; r = USB_RET_ASYNC; }
++        qemu_mutex_unlock(&s->lock);
++        return r;
++    }
++    s->busy = true;
++    s->pending = p;
++    s->transfer_set = set;
++    s->transfer_id = id;
++    s->transfer_epoch = s->epoch;
++    s->transfer_len = s->sizes[type - 1][id];
++    s->guest_len = len;
++    memset(s->transfer, 0, sizeof(s->transfer));
++    s->transfer[0] = id;
++    if (set) { memcpy(s->transfer, data, len); }
++    qemu_mutex_unlock(&s->lock);
++    int r = native_report(s, set, type - 1, id, s->transfer, s->transfer_len);
++    if (r != USB_RET_ASYNC) {
++        qemu_mutex_lock(&s->lock);
++        s->busy = false; s->pending = NULL;
++        qemu_mutex_unlock(&s->lock);
++    }
++    return r;
++}
++static void host_hid_resume(HostHIDState *s)
++{
++    USBDevice *dev = USB_DEVICE(s);
++    qemu_mutex_lock(&s->lock);
++    USBPacket *p = !s->busy && s->live ? s->waiting : NULL;
++    if (p) { s->waiting = NULL; }
++    qemu_mutex_unlock(&s->lock);
++    if (p) {
++        int value = dev->setup_buf[2] | dev->setup_buf[3] << 8;
++        p->status = host_hid_report(s, p, !(dev->setup_buf[0] & USB_DIR_IN),
++                                    value >> 8, value & 255, dev->data_buf, dev->setup_len);
++        if (p->status != USB_RET_ASYNC) {
++            p->actual_length = 0;
++            usb_generic_async_ctrl_complete(dev, p);
++        }
++    }
++}
++static void host_hid_cancel(USBDevice *dev, USBPacket *p)
++{
++    HostHIDState *s = HOST_HID(dev);
++    qemu_mutex_lock(&s->lock);
++    if (s->pending == p) { s->pending = NULL; }
++    if (s->waiting == p) { s->waiting = NULL; }
++    qemu_mutex_unlock(&s->lock);
++    /* The native operation owns its buffer until its bounded completion. */
++}
++static void host_hid_data(USBDevice *dev, USBPacket *p)
++{
++    HostHIDState *s = HOST_HID(dev);
++    uint8_t data[64];
++    if (!dev->config || p->ep->nr != 1 || s->halted[p->pid == USB_TOKEN_IN]) {
++        p->status = USB_RET_STALL; return;
++    }
++    if (p->pid == USB_TOKEN_IN) {
++        qemu_mutex_lock(&s->lock);
++        p->status = !s->live ? USB_RET_NODEV : !s->count ? USB_RET_NAK : USB_RET_SUCCESS;
++        if (p->status == USB_RET_SUCCESS) {
++            unsigned len = s->queue[s->head].len;
++            if (p->iov.size < len) { p->status = USB_RET_BABBLE; }
++            else {
++                usb_packet_copy(p, s->queue[s->head].data, len);
++                s->head = (s->head + 1) % 16; s->count--;
++            }
++        }
++        qemu_mutex_unlock(&s->lock);
++        return;
++    }
++    if (p->iov.size > sizeof(data) || p->pid != USB_TOKEN_OUT || !p->iov.size) {
++        p->status = USB_RET_STALL; return;
++    }
++    usb_packet_copy(p, data, p->iov.size);
++    int r = host_hid_report(s, p, true, 2, s->numbered ? data[0] : 0, data, p->iov.size);
++    if (r == USB_RET_NAK) { p->actual_length = 0; } /* EHCI retries this packet. */
++    if (r < 0) { p->status = r; }
++}
++static void host_hid_abort(HostHIDState *s)
++{
++    qemu_mutex_lock(&s->lock);
++    USBPacket *p = s->pending;
++    USBPacket *waiting = s->waiting;
++    s->pending = s->waiting = NULL;
++    qemu_mutex_unlock(&s->lock);
++    if (waiting) {
++        waiting->status = USB_RET_STALL; waiting->actual_length = 0;
++        usb_generic_async_ctrl_complete(USB_DEVICE(s), waiting);
++    }
++    if (p) {
++        p->status = USB_RET_STALL; p->actual_length = 0;
++        if (p->ep->nr == 0) { usb_generic_async_ctrl_complete(USB_DEVICE(s), p); }
++        else { usb_packet_complete(USB_DEVICE(s), p); }
++    }
++}
++static void host_hid_control(USBDevice *dev, USBPacket *p, int request,
++                             int value, int index, int length, uint8_t *data)
++{
++    HostHIDState *s = HOST_HID(dev);
++    bool valid = true;
++    switch (request) {
++    case 0x0005: valid = !index && !length && value <= 127; break;
++    case 0x0009: valid = !index && !length && value <= 1; break;
++    case 0x8008: valid = !index && !value && length == 1; break;
++    case 0x8000: valid = !index && !value && length == 2; break;
++    case 0x810a: valid = !index && !value && length == 1 && dev->config; break;
++    case 0x010b: valid = !index && !value && !length && dev->config; break;
++    case 0x8006:
++        valid = (value >> 8) == USB_DT_STRING ? (index == 0 || index == 0x409) : !index;
++        break;
++    case 0x0001: case 0x0003: valid = false; break; /* No remote-wake capability. */
++    case 0x8100:
++        if (index || value || length != 2 || !dev->config) { valid = false; break; }
++        data[0] = data[1] = 0; p->actual_length = 2; return;
++    case 0xa102: case 0x210a:
++        /* This bounded report transport supports indefinite (zero) idle only. */
++        if (index || !dev->config || (value >> 8) ||
++            ((value & 255) && !s->sizes[0][value & 255]) ||
++            length != (request == 0xa102 ? 1 : 0)) { valid = false; break; }
++        if (request == 0xa102) { data[0] = 0; p->actual_length = 1; }
++        return;
++    }
++    if (!valid) { p->status = USB_RET_STALL; return; }
++    if (request == 0x8006 && (value == 0x301 || value == 0x302)) {
++        glong units = 0;
++        g_autofree gunichar2 *text = g_utf8_to_utf16(value == 0x301 ? s->product : dev->serial,
++                                                   -1, NULL, &units, NULL);
++        if (!text || units > 126) { p->status = USB_RET_STALL; return; }
++        uint8_t desc[254] = {units * 2 + 2, USB_DT_STRING};
++        for (glong i = 0; i < units; i++) { desc[2 + i * 2] = text[i]; desc[3 + i * 2] = text[i] >> 8; }
++        p->actual_length = MIN(length, units * 2 + 2);
++        memcpy(data, desc, p->actual_length);
++        return;
++    }
++    if (request == 0x8200 && (index == 0 || index == 0x80) && !value && length == 2) {
++        data[0] = data[1] = 0; p->actual_length = 2; return;
++    }
++    if (request == 0x8200 || request == 0x0201 || request == 0x0203) {
++        if (!dev->config || value || (index != 0x81 && index != 1) ||
++            length != (request == 0x8200 ? 2 : 0)) { p->status = USB_RET_STALL; return; }
++        unsigned ep = index == 0x81;
++        if (request == 0x8200) { data[0] = s->halted[ep]; data[1] = 0; p->actual_length = 2; }
++        else { s->halted[ep] = request == 0x0203; }
++        return;
++    }
++    if (request == 0xa101 || request == 0x2109) {
++        int r = index == 0 && dev->config ?
++            host_hid_report(s, p, request == 0x2109, value >> 8, value & 255, data, length) : USB_RET_STALL;
++        if (r < 0) { p->status = r; } else { p->actual_length = r; }
++        return;
++    }
++    if (request == (InterfaceRequest | USB_REQ_GET_DESCRIPTOR) &&
++        index == 0 && (value == 0x2200 || value == 0x2100)) {
++        size_t n = value == 0x2200 ? s->report_desc_len : sizeof(s->hid_desc);
++        p->actual_length = MIN(length, n);
++        memcpy(data, value == 0x2200 ? s->report_desc : s->hid_desc,
++               p->actual_length);
++        return;
++    }
++    if (request == 0x0009 || request == 0x010b) { host_hid_abort(s); }
++    if (usb_desc_handle_control(dev, p, request, value, index, length, data) < 0) {
++        p->status = USB_RET_STALL;
++    } else if (request == (DeviceOutRequest | USB_REQ_SET_CONFIGURATION) ||
++               request == (InterfaceOutRequest | USB_REQ_SET_INTERFACE)) {
++        qemu_mutex_lock(&s->lock);
++        s->configured = dev->config != NULL;
++        s->epoch++; s->head = s->count = 0;
++        s->halted[0] = s->halted[1] = false;
++        qemu_mutex_unlock(&s->lock);
++    }
++}
++static void host_hid_reset(USBDevice *dev)
++{
++    HostHIDState *s = HOST_HID(dev);
++    host_hid_abort(s);
++    qemu_mutex_lock(&s->lock);
++    s->epoch++; s->head = s->count = 0; s->configured = false;
++    s->halted[0] = s->halted[1] = false;
++    qemu_mutex_unlock(&s->lock);
++    usb_desc_init(dev);
++}
++static void host_hid_realize(USBDevice *dev, Error **errp)
++{
++    HostHIDState *s = HOST_HID(dev);
++    if (!s->registry_id || !s->vendorid || !s->productid || !dev->serial) {
++        error_setg(errp, "usb-host-hid requires exact registry-id, vendorid, productid and serial");
++        return;
++    }
++    if (!native_open(s, errp)) {
++        return;
++    }
++    if (!host_hid_parse(s, NULL)) {
++        native_close(s);
++        g_clear_pointer(&s->product, g_free);
++        error_setg(errp, "unsupported or protected HID report descriptor");
++        return;
++    }
++    s->hid_desc[0] = 9; s->hid_desc[1] = 0x21;
++    s->hid_desc[2] = 0x11; s->hid_desc[3] = 1;
++    s->hid_desc[5] = 1; s->hid_desc[6] = 0x22;
++    s->hid_desc[7] = s->report_desc_len;
++    s->hid_desc[8] = s->report_desc_len >> 8;
++    s->other = (USBDescOther){.length=9,.data=s->hid_desc};
++    s->eps[0] = (USBDescEndpoint){.bEndpointAddress=0x81,.bmAttributes=3,.wMaxPacketSize=64,.bInterval=1};
++    s->eps[1] = (USBDescEndpoint){.bEndpointAddress=0x01,.bmAttributes=3,.wMaxPacketSize=64,.bInterval=1};
++    s->iface = (USBDescIface){.bNumEndpoints=2,.bInterfaceClass=3,.ndesc=1,.descs=&s->other,.eps=s->eps};
++    s->config = (USBDescConfig){.bNumInterfaces=1,.bConfigurationValue=1,.bmAttributes=0x80,.bMaxPower=50,.nif=1,.ifs=&s->iface};
++    s->device = (USBDescDevice){.bcdUSB=0x110,.bMaxPacketSize0=64,.bNumConfigurations=1,.confs=&s->config};
++    s->strings[1] = s->product; s->strings[2] = dev->serial;
++    s->desc = (USBDesc){.id={.idVendor=s->vendorid,.idProduct=s->productid,.bcdDevice=0x100,.iProduct=1,.iSerialNumber=2},.full=&s->device,.str=s->strings};
++    dev->usb_desc = &s->desc;
++    usb_desc_init(dev);
++    s->bh = qemu_bh_new(host_hid_bh, s);
++    s->live = true;
++    native_start(s);
++}
++static void host_hid_unrealize(USBDevice *dev)
++{
++    HostHIDState *s = HOST_HID(dev);
++    qemu_mutex_lock(&s->lock);
++    s->closing = true; s->live = false; s->pending = s->waiting = NULL;
++    qemu_mutex_unlock(&s->lock);
++    native_close(s);
++    qemu_bh_delete(s->bh); s->bh = NULL;
++    g_clear_pointer(&s->product, g_free);
++}
++static void host_hid_init(Object *obj)
++{
++    qemu_mutex_init(&HOST_HID(obj)->lock);
++    USB_DEVICE(obj)->flags |= 1 << USB_DEV_FLAG_IS_HOST;
++}
++static void host_hid_finalize(Object *obj)
++{
++    qemu_mutex_destroy(&HOST_HID(obj)->lock);
++}
++static const Property host_hid_properties[] = {
++    DEFINE_PROP_UINT64("registry-id", HostHIDState, registry_id, 0),
++    DEFINE_PROP_UINT16("vendorid", HostHIDState, vendorid, 0),
++    DEFINE_PROP_UINT16("productid", HostHIDState, productid, 0),
++
++};
++static const VMStateDescription host_hid_vmstate = {
++    .name = TYPE_HOST_HID, .unmigratable = 1,
++};
++static void host_hid_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++    uc->realize = host_hid_realize;
++    uc->unrealize = host_hid_unrealize;
++    uc->handle_attach = usb_desc_attach;
++    uc->handle_control = host_hid_control;
++    uc->handle_data = host_hid_data;
++    uc->handle_reset = host_hid_reset;
++    uc->cancel_packet = host_hid_cancel;
++    uc->product_desc = "Native vendor HID report device";
++    dc->vmsd = &host_hid_vmstate;
++    device_class_set_props(dc, host_hid_properties);
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++}
++static const TypeInfo host_hid_type = {
++    .name=TYPE_HOST_HID,.parent=TYPE_USB_DEVICE,.instance_size=sizeof(HostHIDState),
++    .class_init=host_hid_class_init,
++    .instance_init=host_hid_init, .instance_finalize=host_hid_finalize,
++};
++static void host_hid_register(void) { type_register_static(&host_hid_type); }
++type_init(host_hid_register)
++#ifndef HOST_HID_TEST
++static uint64_t native_number(CFTypeRef value)
++{
++    int64_t n;
++    return value && CFGetTypeID(value) == CFNumberGetTypeID() && !CFNumberIsFloatType(value) &&
++        CFNumberGetValue(value, kCFNumberSInt64Type, &n) && n >= 0 ? n : UINT64_MAX;
++}
++static char *native_string(CFTypeRef value)
++{
++    char text[512];
++    if (!value || CFGetTypeID(value) != CFStringGetTypeID() ||
++        !CFStringGetCString(value, text, sizeof(text), kCFStringEncodingUTF8)) { return NULL; }
++    glong n;
++    g_autofree gunichar2 *utf16 = g_utf8_to_utf16(text, -1, NULL, &n, NULL);
++    return utf16 && n <= 126 && n == CFStringGetLength(value) ? g_strdup(text) : NULL;
++}
++/* SCOPE1: this is an observational admission check, not an exclusive lease.
++ * Only the selected physical USB subtree is read, before creating our client. */
++static bool native_unsigned(CFTypeRef value, uint64_t *n)
++{
++    if (!value || CFGetTypeID(value) != CFNumberGetTypeID() ||
++        CFNumberIsFloatType(value)) { return false; }
++    *n = native_number(value);
++    return *n != UINT64_MAX;
++}
++static bool native_metadata(io_registry_entry_t entry, bool required,
++                            uint64_t *page, uint64_t *usage)
++{
++    CFMutableDictionaryRef props = NULL;
++    if (IORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0)
++        != KERN_SUCCESS || !props) { return false; }
++    CFTypeRef built = CFDictionaryGetValue(props, CFSTR(kIOHIDBuiltInKey));
++    uint64_t n;
++    bool ok = !built || built == kCFBooleanFalse ||
++        (native_unsigned(built, &n) && n == 0);
++    CFTypeRef p = CFDictionaryGetValue(props, CFSTR(kIOHIDPrimaryUsagePageKey));
++    CFTypeRef u = CFDictionaryGetValue(props, CFSTR(kIOHIDPrimaryUsageKey));
++    *page = *usage = UINT64_MAX;
++    if (required || p || u) {
++        ok &= native_unsigned(p, page) && *page >= 0xff00 && *page <= 0xffff &&
++              native_unsigned(u, usage) && *usage <= 0xffff;
++    }
++    CFTypeRef pairs = CFDictionaryGetValue(props, CFSTR(kIOHIDDeviceUsagePairsKey));
++    if (required || pairs) {
++        bool matched = false;
++        ok &= pairs && CFGetTypeID(pairs) == CFArrayGetTypeID();
++        CFIndex count = ok ? CFArrayGetCount(pairs) : 0;
++        ok &= count > 0 && count <= 16;
++        for (CFIndex i = 0; ok && i < count; i++) {
++            CFTypeRef pair = CFArrayGetValueAtIndex(pairs, i);
++            uint64_t pp, uu;
++            ok = pair && CFGetTypeID(pair) == CFDictionaryGetTypeID() &&
++                native_unsigned(CFDictionaryGetValue(pair, CFSTR(kIOHIDDeviceUsagePageKey)), &pp) &&
++                pp >= 0xff00 && pp <= 0xffff &&
++                native_unsigned(CFDictionaryGetValue(pair, CFSTR(kIOHIDDeviceUsageKey)), &uu) && uu <= 0xffff;
++            if (ok && p) {
++                /* The accepted descriptor has one application collection. */
++                ok = pp == *page && uu == *usage;
++                matched |= ok;
++            }
++        }
++        if (p) { ok &= matched; }
++    }
++    CFRelease(props);
++    return ok;
++}
++static bool native_tree(io_registry_entry_t entry, uint64_t selected,
++                        unsigned role, unsigned depth, unsigned *budget,
++                        unsigned counts[3], uint64_t page, uint64_t usage)
++{
++    io_name_t cls;
++    uint64_t p, u, id;
++    if (depth > 8 || !*budget || IOObjectGetClass(entry, cls) != KERN_SUCCESS) { return false; }
++    --*budget;
++    bool hid = !strcmp(cls, "AppleUserHIDDevice") || !strcmp(cls, "IOHIDDevice");
++    unsigned next;
++    if (role == 0 && !strcmp(cls, "IOUSBHostDevice")) { next = 1; }
++    else if (role == 1 && !strcmp(cls, "IOUSBHostInterface")) { next = 2; counts[0]++; }
++    else if (role == 2 && hid) {
++        if (IORegistryEntryGetRegistryEntryID(entry, &id) != KERN_SUCCESS || id != selected) { return false; }
++        next = 3; counts[1]++;
++    } else if (role == 3 && !strcmp(cls, "IOHIDInterface")) { next = 4; counts[2]++; }
++    else if (role == 1 && !strcmp(cls, "AppleUSBHostCompositeDevice")) { next = 4; }
++    else { return false; } /* Includes every user client, event/security driver and unknown subclass. */
++    bool required = next == 3 || (role == 3 && next == 4);
++    if (!native_metadata(entry, required, &p, &u) ||
++        (required && (p != page || u != usage))) { return false; }
++    if (next == 2) {
++        const CFStringRef keys[] = {CFSTR("bInterfaceClass"), CFSTR("bInterfaceSubClass"), CFSTR("bInterfaceProtocol")};
++        for (unsigned i = 0; i < 3; i++) {
++            CFTypeRef v = IORegistryEntryCreateCFProperty(entry, keys[i], kCFAllocatorDefault, 0);
++            bool ok = native_unsigned(v, &p) && p == (i == 0 ? 3 : 0);
++            if (v) { CFRelease(v); }
++            if (!ok) { return false; }
++        }
++    }
++    io_iterator_t it = 0;
++    if (IORegistryEntryGetChildIterator(entry, kIOServicePlane, &it) != KERN_SUCCESS || !it) { return false; }
++    io_object_t child;
++    bool ok = true;
++    while (ok && (child = IOIteratorNext(it))) {
++        ok = next != 4 && native_tree(child, selected, next, depth + 1, budget, counts, page, usage);
++        IOObjectRelease(child);
++    }
++    ok &= IOIteratorIsValid(it);
++    IOObjectRelease(it);
++    return ok && counts[0] <= 1 && counts[1] <= 1 && counts[2] <= 1;
++}
++static bool native_root(HostHIDState *s, io_registry_entry_t root)
++{
++    CFMutableDictionaryRef props = NULL;
++    if (IORegistryEntryCreateCFProperties(root, &props, kCFAllocatorDefault, 0)
++        != KERN_SUCCESS || !props) { return false; }
++    uint64_t vendor, product, cls;
++    CFTypeRef value = CFDictionaryGetValue(props, CFSTR("bDeviceClass"));
++    bool ok = native_unsigned(CFDictionaryGetValue(props, CFSTR("idVendor")), &vendor) &&
++        native_unsigned(CFDictionaryGetValue(props, CFSTR("idProduct")), &product) &&
++        vendor == s->vendorid && product == s->productid && vendor && product &&
++        (!value || (native_unsigned(value, &cls) && cls <= 255 && cls != 9 && cls != 17));
++    CFRelease(props);
++    return ok;
++}
++static bool native_single_interface(HostHIDState *s, io_service_t service)
++{
++    uint64_t page, usage;
++    if (!native_metadata(service, true, &page, &usage)) { return false; }
++    /* Match the metadata to the descriptor's one top-level application usage.
++     * The existing parser remains the authority for the complete bounded grammar. */
++    CFTypeRef desc = IORegistryEntryCreateCFProperty(service, CFSTR(kIOHIDReportDescriptorKey), kCFAllocatorDefault, 0);
++    bool ok = desc && CFGetTypeID(desc) == CFDataGetTypeID() &&
++        CFDataGetLength(desc) > 0 && CFDataGetLength(desc) <= sizeof(s->report_desc);
++    if (ok) {
++        s->report_desc_len = CFDataGetLength(desc);
++        memcpy(s->report_desc, CFDataGetBytePtr(desc), s->report_desc_len);
++        uint32_t application = 0;
++        ok = host_hid_parse(s, &application) && application == ((page << 16) | usage);
++    }
++    if (desc) { CFRelease(desc); }
++    if (!ok) { return false; }
++    io_registry_entry_t current = service, parent;
++    IOObjectRetain(current);
++    bool found = false;
++    for (unsigned depth = 0; depth < 16; depth++) {
++        if (IOObjectConformsTo(current, "IOUSBHostDevice")) { found = true; break; }
++        if (IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) != KERN_SUCCESS) { break; }
++        IOObjectRelease(current); current = parent;
++    }
++    unsigned budget = 64, counts[3] = {0};
++    ok = found && native_root(s, current) &&
++        native_tree(current, s->registry_id, 0, 0, &budget, counts, page, usage);
++    IOObjectRelease(current);
++    return ok && counts[0] == 1 && counts[1] == 1;
++}
++static bool native_open(HostHIDState *s, Error **errp)
++{
++    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
++                                IORegistryEntryIDMatching(s->registry_id));
++    uint64_t actual = 0;
++    if (!service) { error_setg(errp, "selected HID registry generation is absent"); return false; }
++    bool eligible = IORegistryEntryGetRegistryEntryID(service, &actual) == KERN_SUCCESS &&
++        actual == s->registry_id && IOObjectConformsTo(service, "IOHIDDevice") &&
++        native_single_interface(s, service);
++    if (eligible) { s->hid = IOHIDDeviceCreate(kCFAllocatorDefault, service); }
++    IOObjectRelease(service);
++    if (!s->hid) { error_setg(errp, "not a single non-boot USB HID interface"); return false; }
++    g_autofree char *serial = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDSerialNumberKey)));
++    g_autofree char *transport = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDTransportKey)));
++    s->product = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDProductKey)));
++    CFTypeRef desc = IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDReportDescriptorKey));
++    eligible = serial && *serial && transport && s->product && !strcmp(transport, "USB") &&
++        !strcmp(serial, USB_DEVICE(s)->serial) &&
++        native_number(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDVendorIDKey))) == s->vendorid &&
++        native_number(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDProductIDKey))) == s->productid &&
++        desc && CFGetTypeID(desc) == CFDataGetTypeID() &&
++        /* Use only the exact descriptor admitted with the registry metadata. */
++        CFDataGetLength(desc) == s->report_desc_len &&
++        !memcmp(s->report_desc, CFDataGetBytePtr(desc), s->report_desc_len);
++    if (!eligible) {
++        error_setg(errp, "HID identity mismatch or unsupported/protected report shape");
++        CFRelease(s->hid); s->hid = NULL;
++        g_clear_pointer(&s->product, g_free);
++        return false;
++    }
++    IOReturn r = IOHIDDeviceOpen(s->hid, kIOHIDOptionsTypeNone);
++    if (r != kIOReturnSuccess) {
++        error_setg(errp, "ordinary-user IOHIDDeviceOpen failed: 0x%x", r);
++        CFRelease(s->hid); s->hid = NULL;
++        g_clear_pointer(&s->product, g_free);
++        return false;
++    }
++    return true;
++}
++static void native_input(void *context, IOReturn result, void *sender,
++                         IOHIDReportType type, uint32_t id, uint8_t *data, CFIndex len)
++{
++    HostHIDState *s = context;
++    if (result == kIOReturnSuccess && type == kIOHIDReportTypeInput && len > 0) {
++        host_hid_receive(s, id, data, len);
++    }
++}
++static void native_removed(void *context, IOReturn result, void *sender)
++{
++    HostHIDState *s = context;
++    qemu_mutex_lock(&s->lock);
++    if (!s->closing) { s->live = false; qemu_bh_schedule(s->bh); }
++    qemu_mutex_unlock(&s->lock);
++}
++static void native_done(void *context, IOReturn result, void *sender,
++                        IOHIDReportType type, uint32_t id, uint8_t *data, CFIndex len)
++{
++    HostHIDState *s = context;
++    /* SET reports completion status, not bytes written; GET reports a size. */
++    bool ok = result == kIOReturnSuccess &&
++        (s->transfer_set || len == s->transfer_len);
++    host_hid_complete(s, ok ? s->transfer_len : USB_RET_STALL);
++}
++static void native_start(HostHIDState *s)
++{
++    s->dispatch = dispatch_queue_create("org.qemu.usb-host-hid", DISPATCH_QUEUE_SERIAL);
++    s->cancelled = dispatch_semaphore_create(0);
++    IOHIDDeviceSetDispatchQueue(s->hid, s->dispatch);
++    IOHIDDeviceRegisterInputReportCallback(s->hid, s->input, sizeof(s->input), native_input, s);
++    IOHIDDeviceRegisterRemovalCallback(s->hid, native_removed, s);
++    IOHIDDeviceSetCancelHandler(s->hid, ^{ dispatch_semaphore_signal(s->cancelled); });
++    IOHIDDeviceActivate(s->hid);
++}
++static void native_close(HostHIDState *s)
++{
++    if (!s->hid) { return; }
++    if (s->dispatch) {
++        IOHIDDeviceCancel(s->hid);
++        dispatch_semaphore_wait(s->cancelled, DISPATCH_TIME_FOREVER);
++        dispatch_sync(s->dispatch, ^{});
++        /* Cancel handler establishes no callback can still access this state. */
++        dispatch_release(s->cancelled);
++        dispatch_release(s->dispatch);
++        s->cancelled = NULL; s->dispatch = NULL;
++    }
++    IOHIDDeviceClose(s->hid, kIOHIDOptionsTypeNone);
++    CFRelease(s->hid); s->hid = NULL;
++}
++static int native_report(HostHIDState *s, bool set, unsigned type,
++                         unsigned id, uint8_t *data, unsigned len)
++{
++    /* Async report completions share IOHID's input notification port and can
++     * consume its only slot. Keep QEMU asynchronous, not the IOHID request. */
++    dispatch_async(s->dispatch, ^{
++        qemu_mutex_lock(&s->lock);
++        bool active = !s->closing && s->live && s->transfer_epoch == s->epoch;
++        qemu_mutex_unlock(&s->lock);
++        if (!active) { host_hid_complete(s, USB_RET_STALL); return; }
++        CFIndex length = len;
++        IOReturn r = set ? IOHIDDeviceSetReport(s->hid, type, id, data, len) :
++            IOHIDDeviceGetReport(s->hid, type, id, data, &length);
++        native_done(s, r, s->hid, type, id, data, length);
++    });
++    return USB_RET_ASYNC;
++}
++#endif
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -81,6 +81,10 @@
+ endif
+ 
+ # usb pass-through
++if host_os == 'darwin' and iokit.found()
++  system_ss.add(when: 'CONFIG_USB', if_true: [files('dev-host-hid.c'),
++    iokit, coref, declare_dependency(compile_args: ['-fblocks'])])
++endif
+ if libusb.found()
+   usbhost_ss = ss.source_set()
+   usbhost_ss.add(when: ['CONFIG_USB', libusb],
+--- /dev/null
++++ b/tests/unit/test-host-hid.c
+@@ -0,0 +1,320 @@
++/* Diskless test: production USB core, fake native device only. */
++#include "qemu/osdep.h"
++static const uint8_t fixture[] = {0x06,0x00,0xff,0x09,0x01,0xa1,0x01,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x3c,0x09,0x01,0x81,0x02,0x95,0x3c,0x09,0x01,0x91,0x02,0x95,0x01,0x09,0x01,0xb1,0x02,0xc0};
++static int opened, closed;
++static bool hold_report;
++static bool use_numbered, fail_report;
++#ifdef HOST_HID_NATIVE_SHIM
++#include "host-hid-native-shim.h"
++#else
++#define HOST_HID_TEST 1
++#endif
++#include "../../hw/usb/dev-host-hid.c"
++#include "system/system.h"
++#ifndef HOST_HID_NATIVE_SHIM
++static bool native_open(HostHIDState *s, Error **errp)
++{
++    memcpy(s->report_desc, fixture, sizeof(fixture));
++    s->report_desc_len = sizeof(fixture);
++    if (use_numbered) {
++        memmove(s->report_desc+9,s->report_desc+7,sizeof(fixture)-7);
++        s->report_desc[7]=0x85; s->report_desc[8]=7;
++        s->report_desc_len+=2;
++    }
++    s->product = g_strdup("BaldurBootLoader");
++    opened++;
++    return true;
++}
++static void native_close(HostHIDState *s) { closed++; }
++static void native_start(HostHIDState *s) {}
++static int native_report(HostHIDState *s, bool set, unsigned type,
++                         unsigned id, uint8_t *data, unsigned len)
++{
++    if (fail_report) return USB_RET_STALL;
++    g_assert_cmpuint(id,==,use_numbered?7:0);
++    g_assert_cmpuint(type,<=,2);
++    g_assert_cmpuint(len,==,(type==2?1:60)+(use_numbered?1:0));
++    if (set) {
++        g_assert_cmpuint(type,>=,1);
++        for (unsigned i=!!id;i<len;i++) g_assert_cmphex(data[i],==,0x5a);
++    } else {
++        memset(data+!!id,0xa5,len-!!id);
++    }
++    if (!hold_report) host_hid_complete(s,len);
++    return USB_RET_ASYNC;
++}
++#endif
++static void port_noop(USBPort *p) {}
++static void complete_noop(USBPort *p, USBPacket *packet) {}
++static USBPortOps pops = {.attach=port_noop,.detach=port_noop,.complete=complete_noop};
++static USBBusOps bops;
++static int packet(USBDevice *d, int pid, int ep, uint8_t *data, int n, int *actual)
++{
++    USBPacket p;
++    usb_packet_init(&p);
++    usb_packet_setup(&p,pid,usb_ep_get(d,pid,ep),0,1,false,false);
++    usb_packet_addbuf(&p,data,n);
++    usb_handle_packet(d,&p);
++    if (p.status == USB_RET_ASYNC) {
++        while (usb_packet_is_inflight(&p)) main_loop_wait(false);
++    }
++    int status=p.status;
++    *actual=p.actual_length;
++    usb_packet_cleanup(&p);
++    return status;
++}
++static int control(USBDevice *d,int req,int value,int index,uint8_t *data,int n,int *actual)
++{
++    uint8_t setup[8]={req>>8,req,value,value>>8,index,index>>8,n,n>>8};
++    int a, r=packet(d,USB_TOKEN_SETUP,0,setup,8,&a);
++    if(r) return r;
++    *actual=0;
++    while(*actual<n) {
++        int chunk=MIN(64,n-*actual), got;
++        r=packet(d,(req&0x8000)?USB_TOKEN_IN:USB_TOKEN_OUT,0,data+*actual,chunk,&got);
++        if(r) return r;
++        *actual+=got;
++        if(got<chunk) break;
++    }
++    return packet(d,(req&0x8000)?USB_TOKEN_OUT:USB_TOKEN_IN,0,NULL,0,&a);
++}
++static void parser_checks(void)
++{
++    HostHIDState *s=g_new0(HostHIDState,1);
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc_len=sizeof(fixture);
++    uint32_t application = 0;
++    g_assert_true(host_hid_parse(s, &application));
++    g_assert_cmpuint(application,==,0xff000001);
++    g_assert_cmpuint(s->sizes[0][0],==,60);
++    g_assert_cmpuint(s->sizes[1][0],==,60);
++    g_assert_cmpuint(s->sizes[2][0],==,1);
++    for(size_t i=0;i<sizeof(fixture);i++) {
++        s->report_desc_len=i; g_assert_false(host_hid_parse(s, NULL));
++    }
++    s->report_desc_len=sizeof(fixture);
++    s->report_desc[2]=1; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc[15]=255; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc[7]=0xa4; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    memmove(s->report_desc+22,s->report_desc+20,sizeof(fixture)-20);
++    s->report_desc[20]=0x85; s->report_desc[21]=7; s->report_desc_len+=2;
++    g_assert_false(host_hid_parse(s, NULL));
++    uint32_t seed=123;
++    for(unsigned i=0;i<20000;i++) {
++        s->report_desc_len=i%sizeof(s->report_desc);
++        for(size_t j=0;j<s->report_desc_len;j++) {
++            seed=seed*1664525+1013904223; s->report_desc[j]=seed>>24;
++        }
++        host_hid_parse(s, NULL);
++    }
++    g_free(s);
++    puts("PASS: vendor-only descriptor policy, truncation, overflow, mixed IDs, 20000 deterministic malformed descriptors");
++}
++static void *deliver_input(void *opaque)
++{
++    uint8_t data[61]; memset(data,0x42,sizeof(data)); data[0]=7;
++    host_hid_receive(opaque,7,data,sizeof(data));
++    return NULL;
++}
++static void native_policy_checks(USBBus *bus)
++{
++#ifdef HOST_HID_NATIVE_SHIM
++    int before=opened;
++    for(int mode=0;mode<5;mode++) {
++        USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++        qdev_prop_set_uint64(&d->qdev,"registry-id",mode==4?0:1000+mode);
++        qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++        qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++        qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++        shim_interfaces=mode==0?2:1; shim_protocol=mode==1?1:0;
++        shim_wrong_identity=mode==2; shim_denied=mode==3;
++        Error *err=NULL;
++        bool ok=qdev_realize(&d->qdev,&bus->qbus,&err);
++        g_assert_false(ok); g_assert_nonnull(err);
++        printf("PASS: native admission rejection %d: %s\n",mode,error_get_pretty(err));
++        error_free(err); object_unref(d);
++    }
++    shim_interfaces=1; shim_protocol=shim_denied=0; shim_wrong_identity=false;
++    g_assert_cmpint(opened,==,before);
++#endif
++}
++int (*qemu_main)(void);
++int main(void)
++{
++    const char *args[]={"host-hid-test","-machine","none","-accel","qtest","-nodefaults","-no-user-config","-display","none","-net","none","-S",NULL};
++    char *argv[13];
++    for (int i=0;i<13;i++) argv[i]=g_strdup(args[i]);
++    qemu_init(12,argv);
++    parser_checks();
++    USBBus bus;
++    USBPort ports[2];
++    DeviceState *host=qdev_new("usb-hub");
++    usb_bus_new(&bus,sizeof(bus),&bops,host);
++    for(int i=0;i<2;i++) usb_register_port(&bus,&ports[i],NULL,i,&pops,USB_SPEED_MASK_FULL);
++    native_policy_checks(&bus);
++    USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",123);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort);
++    usb_device_reset(d);
++    uint8_t buf[256]={0}; int n;
++    g_assert_cmpint(control(d,0x8006,0x100,0,buf,18,&n),==,0);
++    g_assert_cmpint(n,==,18);
++    g_assert_cmphex(buf[8]|buf[9]<<8,==,0xc251);
++    g_assert_cmpint(control(d,0x8006,0x200,0,buf,sizeof(buf),&n),==,0);
++    const uint8_t types[]={2,4,0x21,5,5};
++    int pos=0;
++    for(unsigned i=0;i<ARRAY_SIZE(types);i++) {
++        g_assert_cmpint(buf[pos],>=,2);
++        g_assert_cmpint(pos+buf[pos],<=,n);
++        g_assert_cmpint(buf[pos+1],==,types[i]);
++        if(types[i]==4) g_assert_cmpint(buf[pos+5],==,3);
++        if(types[i]==5) { g_assert_cmpint(buf[pos+3],==,3); g_assert_cmpint(buf[pos+4],==,64); }
++        pos+=buf[pos];
++    }
++    g_assert_cmpint(pos,==,n); g_assert_cmpint(buf[2]|buf[3]<<8,==,n);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0x8106,0x2200,0,buf,sizeof(buf),&n),==,0);
++    g_assert_cmpint(n,==,sizeof(fixture));
++    g_assert_cmpmem(buf,n,fixture,sizeof(fixture));
++    memset(buf,0x5a,60);
++    g_assert_cmpint(control(d,0x2109,0x200,0,buf,60,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    g_assert_cmpint(control(d,0x2109,0x300,0,buf,1,&n),==,0);
++    g_assert_cmpint(control(d,0xa101,0x100,0,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60); g_assert_cmphex(buf[59],==,0xa5);
++    g_assert_cmpint(control(d,0xa101,0x200,0,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    g_assert_cmpint(control(d,0xa101,0x300,0,buf,1,&n),==,0);
++    g_assert_cmpint(n,==,1);
++    g_assert_cmphex(buf[0],==,0xa5);
++    g_assert_cmpint(control(d,0x2109,0x200,0,buf,61,&n),==,USB_RET_STALL);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    memset(buf,0x7c,60);
++    host_hid_receive(HOST_HID(d),0,buf,60);
++    main_loop_wait(true);
++    memset(buf,0,64);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,32,&n),==,USB_RET_BABBLE);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    for(int i=0;i<60;i++) g_assert_cmphex(buf[i],==,0x7c);
++    g_assert_cmpint(control(d,0x0203,0,0x81,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0x8200,0,0x81,buf,2,&n),==,0);
++    g_assert_cmpint(n,==,2); g_assert_cmpint(buf[0],==,1);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x0201,0,0x81,buf,0,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    host_hid_receive(HOST_HID(d),0,buf,60);
++    usb_device_reset(d);
++    g_assert_cmpint(control(d,0x8008,0,0,buf,1,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    /* Invalid standard fields must not silently mutate the virtual bus. */
++    g_assert_cmpint(control(d,0x0005,128,0,buf,0,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x0009,1,1,buf,0,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x8000,0,1,buf,2,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x8200,0,0,buf,2,&n),==,0);
++    g_assert_cmpint(control(d,0x8100,0,0,buf,2,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x210a,0,0,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0xa102,0,0,buf,1,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x210b,1,0,buf,0,&n),==,USB_RET_STALL);
++    g_free(HOST_HID(d)->product);
++    HOST_HID(d)->product=g_strdup("Baldur \xc5\xbd");
++    HOST_HID(d)->strings[1]=HOST_HID(d)->product;
++    g_assert_cmpint(control(d,0x8006,0x0301,0x409,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,18);
++    g_assert_cmphex(buf[16]|buf[17]<<8,==,0x017d);
++    hold_report=true;
++    USBPacket held;
++    usb_packet_init(&held);
++    memset(buf,0x5a,60);
++    usb_packet_setup(&held,USB_TOKEN_OUT,usb_ep_get(d,USB_TOKEN_OUT,1),0,10,false,false);
++    usb_packet_addbuf(&held,buf,60);
++    usb_handle_packet(d,&held);
++    g_assert_cmpint(held.status,==,USB_RET_ASYNC);
++    usb_device_reset(d);
++    g_assert_false(usb_packet_is_inflight(&held));
++    g_assert_cmpint(held.status,==,USB_RET_STALL);
++    usb_packet_cleanup(&held);
++    host_hid_complete(HOST_HID(d),60);
++    main_loop_wait(true);
++    g_assert_false(HOST_HID(d)->busy);
++    hold_report=false;
++    qdev_unrealize(&d->qdev);
++    object_unref(d);
++    g_assert_cmpint(opened,==,1); g_assert_cmpint(closed,==,1);
++    puts("PASS: real EP0 enumeration, unnumbered 60-byte OUT/IN, feature1, UTF16 strings, halt/clear/reset, cancellation and release");
++    use_numbered=true;
++    d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",124);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort); usb_device_reset(d);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    memset(buf,0x5a,61); buf[0]=7;
++    g_assert_cmpint(control(d,0x2109,0x207,0,buf,61,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,61,&n),==,0);
++    g_assert_cmpint(n,==,61);
++    g_assert_cmpint(control(d,0xa101,0x307,0,buf,2,&n),==,0);
++    g_assert_cmpint(n,==,2); g_assert_cmpint(buf[0],==,7); g_assert_cmpint(buf[1],==,0xa5);
++    g_assert_cmpint(control(d,0x2109,0x207,0,buf,60,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0xa101,0x308,0,buf,2,&n),==,USB_RET_STALL);
++    QemuThread thread;
++    qemu_thread_create(&thread,"fake-hid-callback",deliver_input,HOST_HID(d),QEMU_THREAD_JOINABLE);
++    qemu_thread_join(&thread); main_loop_wait(true);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,61); g_assert_cmpint(buf[0],==,7); g_assert_cmpint(buf[60],==,0x42);
++    fail_report=true;
++    g_assert_cmpint(control(d,0xa101,0x307,0,buf,2,&n),==,USB_RET_STALL);
++    g_assert_false(HOST_HID(d)->busy); fail_report=false;
++#ifdef HOST_HID_NATIVE_SHIM
++    uint8_t native_data[61]; memset(native_data,0x42,61); native_data[0]=7;
++    uint8_t *native_pointer=native_data;
++    dispatch_sync(shim_queue,^{shim_input(shim_context,0,NULL,kIOHIDReportTypeInput,7,native_pointer,61);});
++    main_loop_wait(true);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,61);
++#endif
++    for(int i=0;i<17;i++) deliver_input(HOST_HID(d));
++    main_loop_wait(true);
++    g_assert_false(HOST_HID(d)->live); g_assert_false(d->attached);
++    deliver_input(HOST_HID(d)); main_loop_wait(true);
++    g_assert_false(d->attached);
++    qdev_unrealize(&d->qdev); object_unref(d);
++    g_assert_cmpint(opened,==,2); g_assert_cmpint(closed,==,2);
++    puts("PASS: numbered 61-byte reports, cross-thread callback, error cleanup, overflow fail-closed, no automatic reattach");
++#ifdef HOST_HID_NATIVE_SHIM
++    d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",125);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort); usb_device_reset(d);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    hold_report=true;
++    usb_packet_init(&held); memset(buf,0x5a,61); buf[0]=7;
++    usb_packet_setup(&held,USB_TOKEN_OUT,usb_ep_get(d,USB_TOKEN_OUT,1),0,20,false,false);
++    usb_packet_addbuf(&held,buf,61); usb_handle_packet(d,&held);
++    g_assert_cmpint(held.status,==,USB_RET_ASYNC);
++    dispatch_sync(shim_queue,^{shim_removed(shim_context,0,NULL);});
++    main_loop_wait(true);
++    g_assert_false(d->attached);
++    g_assert_false(usb_packet_is_inflight(&held));
++    g_assert_cmpint(held.status,==,USB_RET_STALL);
++    usb_packet_cleanup(&held);
++    qdev_unrealize(&d->qdev); object_unref(d); hold_report=false;
++    g_assert_cmpint(opened,==,3); g_assert_cmpint(closed,==,3);
++    puts("PASS: native removal while OUT pending completes/stalls before detach; dispatch cancellation drained before release");
++#endif
++    return 0;
++}
+--- /dev/null
++++ b/tests/unit/host-hid-native-shim.h
+@@ -0,0 +1,114 @@
++/* No-hardware IOKit API boundary. Real CF objects and libdispatch scheduling.
++ * Every native IOKit symbol referenced by dev-host-hid.c is replaced here. */
++#include <IOKit/IOKitLib.h>
++#include <IOKit/hid/IOHIDDevice.h>
++#include <dispatch/dispatch.h>
++#include <Block.h>
++static uint64_t shim_id;
++static int shim_interfaces=1, shim_protocol, shim_cursor, shim_denied;
++static bool shim_wrong_identity;
++static dispatch_queue_t shim_queue;
++static dispatch_block_t shim_cancel;
++static IOHIDReportCallback shim_input;
++static IOHIDCallback shim_removed;
++static void *shim_context;
++static CFMutableDictionaryRef shim_matching(uint64_t id)
++{
++    shim_id=id;
++    return CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++}
++static io_service_t shim_service(mach_port_t port, CFDictionaryRef match)
++{ CFRelease(match); return 1; }
++static kern_return_t shim_registry(io_registry_entry_t e, uint64_t *id)
++{ *id=shim_id; return KERN_SUCCESS; }
++static boolean_t shim_conforms(io_object_t e, const io_name_t name)
++{
++    return (e==1 && !strcmp(name,"IOHIDDevice")) ||
++           (e==2 && !strcmp(name,"IOUSBHostDevice")) ||
++           (e>=3 && e<20 && !strcmp(name,"IOUSBHostInterface"));
++}
++static kern_return_t shim_parent(io_registry_entry_t e,const io_name_t plane,io_registry_entry_t *parent)
++{ *parent=2; return e==1?KERN_SUCCESS:KERN_FAILURE; }
++static kern_return_t shim_retain(io_object_t e) { return KERN_SUCCESS; }
++static kern_return_t shim_release(io_object_t e) { return KERN_SUCCESS; }
++static kern_return_t shim_iterator(io_registry_entry_t e,const io_name_t plane,IOOptionBits options,io_iterator_t *it)
++{ g_assert_cmpint(e,==,2); *it=100; shim_cursor=0; return KERN_SUCCESS; }
++static io_object_t shim_next(io_iterator_t it)
++{ return shim_cursor<shim_interfaces?3+shim_cursor++:0; }
++static CFTypeRef shim_registry_prop(io_registry_entry_t e,CFStringRef key,CFAllocatorRef allocator,IOOptionBits options)
++{
++    int n=CFEqual(key,CFSTR("bInterfaceClass"))?3:CFEqual(key,CFSTR("bInterfaceProtocol"))?shim_protocol:0;
++    return CFNumberCreate(NULL,kCFNumberIntType,&n);
++}
++static IOHIDDeviceRef shim_create(CFAllocatorRef allocator,io_service_t service)
++{
++    CFMutableDictionaryRef d=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(d,CFSTR(kIOHIDSerialNumberKey),CFSTR("tFIXTUR0E123"));
++    CFDictionarySetValue(d,CFSTR(kIOHIDProductKey),CFSTR("BaldurBootLoader"));
++    CFDictionarySetValue(d,CFSTR(kIOHIDTransportKey),CFSTR("USB"));
++    int v=shim_wrong_identity?1:0xc251, p=0x1701;
++    CFNumberRef vendor=CFNumberCreate(NULL,kCFNumberIntType,&v), product=CFNumberCreate(NULL,kCFNumberIntType,&p);
++    CFDictionarySetValue(d,CFSTR(kIOHIDVendorIDKey),vendor); CFRelease(vendor);
++    CFDictionarySetValue(d,CFSTR(kIOHIDProductIDKey),product); CFRelease(product);
++    uint8_t desc[sizeof(fixture)+2]; memcpy(desc,fixture,sizeof(fixture));
++    if(use_numbered) { memmove(desc+9,desc+7,sizeof(fixture)-7); desc[7]=0x85; desc[8]=7; }
++    CFDataRef report=CFDataCreate(NULL,desc,sizeof(fixture)+(use_numbered?2:0));
++    CFDictionarySetValue(d,CFSTR(kIOHIDReportDescriptorKey),report); CFRelease(report);
++    return (IOHIDDeviceRef)d;
++}
++static CFTypeRef shim_prop(IOHIDDeviceRef d,CFStringRef key)
++{ return CFDictionaryGetValue((CFDictionaryRef)d,key); }
++static IOReturn shim_open(IOHIDDeviceRef d,IOOptionBits options)
++{ g_assert_cmpuint(options,==,kIOHIDOptionsTypeNone); if(shim_denied) return kIOReturnNotPermitted; opened++; return 0; }
++static IOReturn shim_close(IOHIDDeviceRef d,IOOptionBits options)
++{ closed++; return 0; }
++static void shim_set_queue(IOHIDDeviceRef d,dispatch_queue_t queue) { shim_queue=queue; }
++static void shim_set_cancel(IOHIDDeviceRef d,dispatch_block_t block) { shim_cancel=Block_copy(block); }
++static void shim_activate(IOHIDDeviceRef d) {}
++static void shim_cancel_device(IOHIDDeviceRef d)
++{ dispatch_async(shim_queue,shim_cancel); Block_release(shim_cancel); shim_cancel=NULL; }
++static void shim_register_input(IOHIDDeviceRef d,uint8_t *report,CFIndex len,IOHIDReportCallback cb,void *ctx)
++{ g_assert_cmpint(len,==,64); shim_input=cb; shim_context=ctx; }
++static void shim_register_removal(IOHIDDeviceRef d,IOHIDCallback cb,void *ctx)
++{ shim_removed=cb; }
++static IOReturn shim_set_report(IOHIDDeviceRef d,IOHIDReportType type,CFIndex id,const uint8_t *data,CFIndex len,CFTimeInterval timeout,IOHIDReportCallback callback,void *ctx)
++{
++    if(fail_report) return kIOReturnError;
++    g_assert_cmpuint(id,==,use_numbered?7:0); g_assert_cmpuint(type,>=,1); g_assert_cmpuint(type,<=,2);
++    g_assert_cmpint(len,==,(type==2?1:60)+(use_numbered?1:0)); g_assert_cmpint(timeout,==,1000);
++    for(CFIndex i=!!id;i<len;i++) g_assert_cmphex(data[i],==,0x5a);
++    /* Successful native SET completions do not echo bytes written. */
++    if(!hold_report) dispatch_async(shim_queue,^{callback(ctx,0,d,type,id,(uint8_t *)data,0);});
++    return 0;
++}
++static IOReturn shim_get_report(IOHIDDeviceRef d,IOHIDReportType type,CFIndex id,uint8_t *data,CFIndex *length,CFTimeInterval timeout,IOHIDReportCallback callback,void *ctx)
++{
++    if(fail_report) return kIOReturnError;
++    CFIndex len=*length;
++    g_assert_cmpuint(id,==,use_numbered?7:0); g_assert_cmpuint(type,<=,2);
++    g_assert_cmpint(len,==,(type==2?1:60)+(use_numbered?1:0)); g_assert_cmpint(timeout,==,1000);
++    dispatch_async(shim_queue,^{memset(data+!!id,0xa5,len-!!id); callback(ctx,0,d,type,id,data,len);});
++    return 0;
++}
++#define IORegistryEntryIDMatching shim_matching
++#define IOServiceGetMatchingService shim_service
++#define IORegistryEntryGetRegistryEntryID shim_registry
++#define IOObjectConformsTo shim_conforms
++#define IORegistryEntryGetParentEntry shim_parent
++#define IOObjectRetain shim_retain
++#define IOObjectRelease shim_release
++#define IORegistryEntryCreateIterator shim_iterator
++#define IOIteratorNext shim_next
++#define IORegistryEntryCreateCFProperty shim_registry_prop
++#define IOHIDDeviceCreate shim_create
++#define IOHIDDeviceGetProperty shim_prop
++#define IOHIDDeviceOpen shim_open
++#define IOHIDDeviceClose shim_close
++#define IOHIDDeviceSetDispatchQueue shim_set_queue
++#define IOHIDDeviceSetCancelHandler shim_set_cancel
++#define IOHIDDeviceActivate shim_activate
++#define IOHIDDeviceCancel shim_cancel_device
++#define IOHIDDeviceRegisterInputReportCallback shim_register_input
++#define IOHIDDeviceRegisterRemovalCallback shim_register_removal
++#define IOHIDDeviceSetReportWithCallback shim_set_report
++#define IOHIDDeviceGetReportWithCallback shim_get_report
+--- /dev/null
++++ b/tests/unit/review-test.c
+@@ -0,0 +1,213 @@
++/* Independent no-hardware probes. Production source is an exact frozen copy. */
++#include "review-test-base.inc"
++
++static void review_init(void)
++{
++    const char *args[]={"hid-review","-machine","none","-accel","qtest","-nodefaults","-no-user-config","-display","none","-net","none","-S",NULL};
++    char *argv[13];
++    for(int i=0;i<13;i++) argv[i]=g_strdup(args[i]);
++    qemu_init(12,argv);
++}
++static USBDevice *review_device(USBBus *bus, bool realize)
++{
++    USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",123);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    if(realize) { qdev_realize(&d->qdev,&bus->qbus,&error_abort); usb_device_reset(d); }
++    return d;
++}
++static void review_configure(USBDevice *d, int value)
++{
++    uint8_t buf[1]={0}; int n;
++    g_assert_cmpint(control(d,0x0009,value,0,buf,0,&n),==,0);
++}
++static void review_out(USBDevice *d, USBPacket *p, uint8_t *buf, uint64_t id)
++{
++    memset(buf,0x5a,60); usb_packet_init(p);
++    usb_packet_setup(p,USB_TOKEN_OUT,usb_ep_get(d,USB_TOKEN_OUT,1),0,id,false,false);
++    usb_packet_addbuf(p,buf,60); usb_handle_packet(d,p);
++}
++static void review_deliver_pending(IOReturn result)
++{
++    dispatch_sync(shim_queue,^{review_pending_cb(review_pending_ctx,result,review_pending_device,review_pending_type,review_pending_id,review_pending_data,review_pending_len);});
++    review_pending_cb=NULL;
++    main_loop_wait(true);
++}
++static void review_destroy(USBDevice *d)
++{
++    qdev_unrealize(&d->qdev); object_unref(d);
++}
++int main(void)
++{
++    const char *mode=getenv("REVIEW_CASE");
++    g_assert_nonnull(mode);
++    if(!strcmp(mode,"baseline")) return original_test_main();
++    review_init();
++    USBBus bus; USBPort ports[2];
++    DeviceState *host=qdev_new("usb-hub");
++    usb_bus_new(&bus,sizeof(bus),&bops,host);
++    for(int i=0;i<2;i++) usb_register_port(&bus,&ports[i],NULL,i,&pops,USB_SPEED_MASK_FULL);
++    uint8_t buf[256]={0}; int n;
++    if(!strcmp(mode,"admission")) {
++        native_policy_checks(&bus);
++        for(int i=0;i<2;i++) {
++            review_registry_delta=i==0; review_no_service=i==1;
++            USBDevice *d=review_device(&bus,false); Error *err=NULL;
++            int before=review_open_attempts;
++            g_assert_false(qdev_realize(&d->qdev,&bus.qbus,&err));
++            g_assert_nonnull(err); g_assert_cmpint(review_open_attempts,==,before);
++            printf("PASS admission %s: %s\n",i?"missing-generation":"ID-recheck",error_get_pretty(err));
++            error_free(err); object_unref(d);
++        }
++        return 0;
++    }
++    USBDevice *d=review_device(&bus,true); HostHIDState *s=HOST_HID(d);
++    if(!strcmp(mode,"default-unicode-parser")) {
++        g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_STALL);
++        g_assert_cmpint(control(d,0xa101,0x100,0,buf,60,&n),==,USB_RET_STALL);
++        g_assert_cmpint(control(d,0x810a,0,0,buf,1,&n),==,USB_RET_STALL);
++        g_assert_cmpint(control(d,0x8006,0x100,0,buf,1,&n),==,0); g_assert_cmpint(n,==,1);
++        g_assert_cmpint(control(d,0x8006,0x201,0,buf,64,&n),==,USB_RET_STALL);
++        g_free(s->product); s->product=g_strdup("\xf0\x9f\x98\x80"); s->strings[1]=s->product;
++        g_assert_cmpint(control(d,0x8006,0x301,0x409,buf,64,&n),==,0);
++        const uint8_t unicode[]={6,3,0x3d,0xd8,0x00,0xde}; g_assert_cmpmem(buf,n,unicode,sizeof(unicode));
++        HostHIDState *p=g_new0(HostHIDState,1);
++        memcpy(p->report_desc,fixture,sizeof(fixture)); p->report_desc_len=sizeof(fixture);
++        p->report_desc[15]=64; g_assert_true(host_hid_parse(p, NULL)); g_assert_cmpint(p->sizes[0][0],==,64);
++        p->report_desc[15]=65; g_assert_false(host_hid_parse(p, NULL));
++        memcpy(p->report_desc,fixture,sizeof(fixture));
++        memmove(p->report_desc+12,p->report_desc+7,sizeof(fixture)-7);
++        const uint8_t protected_usage[]={0x0b,1,0,0x0c,0,0x00};
++        memcpy(p->report_desc+7,protected_usage,5); p->report_desc_len=sizeof(fixture)+5;
++        g_assert_false(host_hid_parse(p, NULL)); g_free(p);
++        review_destroy(d); puts("PASS default controls, descriptor bounds, astral UTF16, 64/65-byte parser, protected extended usage"); return 0;
++    }
++    review_configure(d,1);
++    if(!strcmp(mode,"set-callback-zero")) {
++        review_length_delta=-60; memset(buf,0x5a,60);
++        int out=packet(d,USB_TOKEN_OUT,1,buf,60,&n); int out_actual=n;
++        int ctl=control(d,0x2109,0x200,0,buf,60,&n);
++        review_length_delta=-1;
++        int feature=control(d,0x2109,0x300,0,buf,1,&n);
++        printf("SET_CALLBACK_SUCCESS_LEN0 interrupt=%d actual=%d control=%d feature=%d expected_status=0 set_calls=%d\n",out,out_actual,ctl,feature,review_set_calls);
++        review_destroy(d); return out || ctl || feature ? 1 : 0;
++    }
++    if(!strcmp(mode,"set-callback-control")) {
++        memset(buf,0x5a,60);
++        g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,60,&n),==,0); g_assert_cmpint(n,==,60);
++        g_assert_cmpint(control(d,0x2109,0x200,0,buf,60,&n),==,0);
++        review_result=kIOReturnTimeout;
++        g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,60,&n),==,USB_RET_STALL);
++        g_assert_false(s->busy);
++        review_destroy(d); puts("PASS SET callback old length60 succeeds; timeout still fails (negative control)"); return 0;
++    }
++    if(!strcmp(mode,"busy-xhci-control")) {
++        hold_report=true; USBPacket out; review_out(d,&out,buf,15);
++        USBPacket ctl; uint8_t answer[60]={0}; usb_packet_init(&ctl);
++        usb_packet_setup(&ctl,USB_TOKEN_IN,usb_ep_get(d,USB_TOKEN_IN,0),0,16,false,false);
++        usb_packet_addbuf(&ctl,answer,60);
++        ctl.parameter=UINT64_C(0x003c0000010001a1);
++        usb_handle_packet(d,&ctl); g_assert_cmpint(ctl.status,==,USB_RET_NAK);
++        review_deliver_pending(0); usb_packet_cleanup(&out); hold_report=false;
++        /* Exact retry boundary of hcd-xhci.c:1927/1604/1625. */
++        usb_packet_setup(&ctl,USB_TOKEN_IN,usb_ep_get(d,USB_TOKEN_IN,0),0,16,false,false);
++        usb_packet_addbuf(&ctl,answer,60); usb_handle_packet(d,&ctl);
++        while(usb_packet_is_inflight(&ctl)) main_loop_wait(false);
++        int status=ctl.status;
++        printf("BUSY_XHCI_CONTROL retry_status=%d expected=0 get_calls=%d\n",status,review_get_calls);
++        usb_packet_cleanup(&ctl); review_destroy(d); return status ? 1 : 0;
++    }
++    if(!strcmp(mode,"busy-out-fresh-control")) {
++        hold_report=true; USBPacket out; review_out(d,&out,buf,17);
++        usb_cancel_packet(&out); usb_packet_cleanup(&out);
++        uint8_t fresh[60]; USBPacket p; review_out(d,&p,fresh,18);
++        g_assert_cmpint(p.status,==,USB_RET_NAK); usb_packet_cleanup(&p);
++        review_deliver_pending(0); hold_report=false;
++        review_out(d,&p,fresh,19);
++        while(usb_packet_is_inflight(&p)) main_loop_wait(false);
++        g_assert_cmpint(p.status,==,0); usb_packet_cleanup(&p); review_destroy(d);
++        puts("PASS fresh OUT submission after busy drain succeeds (negative control)"); return 0;
++    }
++    if(!strcmp(mode,"busy-out-retry")) {
++        review_hold_get=true;
++        USBPacket pending;
++        uint8_t setup[]={0xa1,1,0,1,0,0,60,0};
++        usb_packet_init(&pending);
++        usb_packet_setup(&pending,USB_TOKEN_SETUP,usb_ep_get(d,USB_TOKEN_IN,0),0,10,false,false);
++        usb_packet_addbuf(&pending,setup,8); usb_handle_packet(d,&pending);
++        g_assert_cmpint(pending.status,==,USB_RET_ASYNC);
++        USBPacket out; review_out(d,&out,buf,11);
++        g_assert_cmpint(out.status,==,USB_RET_NAK);
++        printf("BUSY_OUT_FIRST status=%d actual=%d; retry same SETUP packet as EHCI does\n",out.status,out.actual_length); fflush(stdout);
++        usb_handle_packet(d,&out);
++        printf("BUSY_OUT_RETRY status=%d actual=%d\n",out.status,out.actual_length);
++        return out.status==USB_RET_NAK && out.actual_length==0 ? 0 : 1;
++    }
++    if(!strcmp(mode,"busy-control-status")) {
++        hold_report=true; USBPacket out; review_out(d,&out,buf,1);
++        g_assert_cmpint(out.status,==,USB_RET_ASYNC);
++        uint8_t setup[]={0x21,9,0,2,0,0,60,0};
++        g_assert_cmpint(packet(d,USB_TOKEN_SETUP,0,setup,8,&n),==,0);
++        memset(buf,0x5a,60); g_assert_cmpint(packet(d,USB_TOKEN_OUT,0,buf,60,&n),==,0);
++        int first=packet(d,USB_TOKEN_IN,0,NULL,0,&n);
++        g_assert_cmpint(first,==,USB_RET_NAK);
++        review_deliver_pending(0); usb_packet_cleanup(&out); hold_report=false;
++        int retry=packet(d,USB_TOKEN_IN,0,NULL,0,&n);
++        printf("BUSY_CONTROL_STATUS first=%d retry_after_native_complete=%d expected_retry=0 set_calls=%d\n",first,retry,review_set_calls);
++        review_destroy(d); return retry ? 1 : 0;
++    }
++    if(!strcmp(mode,"config-cancel-late")) {
++        for(int value=0;value<=1;value++) {
++            hold_report=true; USBPacket out; review_out(d,&out,buf,2+value);
++            g_assert_cmpint(out.status,==,USB_RET_ASYNC);
++            review_configure(d,value);
++            g_assert_false(usb_packet_is_inflight(&out)); g_assert_cmpint(out.status,==,USB_RET_STALL);
++            g_assert_null(s->pending); g_assert_true(s->busy);
++            usb_packet_cleanup(&out); review_deliver_pending(0); g_assert_false(s->busy); hold_report=false;
++            review_configure(d,1);
++            memset(buf,0x5a,60); g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,60,&n),==,0);
++        }
++        hold_report=true; USBPacket canceled; review_out(d,&canceled,buf,4);
++        usb_cancel_packet(&canceled); usb_packet_cleanup(&canceled);
++        g_assert_null(s->pending); g_assert_true(s->busy);
++        review_deliver_pending(kIOReturnAborted); g_assert_false(s->busy);
++        review_destroy(d); puts("PASS SET_CONFIGURATION0/1 abort, late native completion, explicit USB cancel retains buffer"); return 0;
++    }
++    if(!strcmp(mode,"error-length-timeout")) {
++        review_result=kIOReturnTimeout;
++        g_assert_cmpint(control(d,0xa101,0x300,0,buf,1,&n),==,USB_RET_STALL); g_assert_false(s->busy);
++        review_result=0; review_length_delta=-1;
++        g_assert_cmpint(control(d,0xa101,0x300,0,buf,1,&n),==,USB_RET_STALL); g_assert_false(s->busy);
++        review_length_delta=1;
++        g_assert_cmpint(control(d,0xa101,0x300,0,buf,1,&n),==,USB_RET_STALL); g_assert_false(s->busy);
++        review_length_delta=0;
++        g_assert_cmpint(control(d,0xa101,0x300,0,buf,64,&n),==,0); g_assert_cmpint(n,==,1);
++        review_destroy(d); puts("PASS async timeout, GET short/oversize rejects, recovery and host-buffer truncation"); return 0;
++    }
++    if(!strcmp(mode,"queued-outputs")) {
++        USBPacket a,b; uint8_t aa[60],bb[60];
++        review_out(d,&a,aa,4); review_out(d,&b,bb,5);
++        g_assert_cmpint(a.status,==,USB_RET_ASYNC); g_assert_cmpint(b.status,==,USB_RET_ASYNC);
++        while(usb_packet_is_inflight(&a)||usb_packet_is_inflight(&b)) main_loop_wait(false);
++        g_assert_cmpint(a.status,==,0); g_assert_cmpint(b.status,==,0);
++        usb_packet_cleanup(&a); usb_packet_cleanup(&b); review_destroy(d);
++        puts("PASS queued interrupt OUT reentrant completion"); return 0;
++    }
++    if(!strcmp(mode,"delete-pending-callback")) {
++        hold_report=true; review_complete_on_cancel=true;
++        USBPacket out; review_out(d,&out,buf,6);
++        usb_cancel_packet(&out); usb_packet_cleanup(&out);
++        review_destroy(d);
++        g_assert_cmpint(closed,==,1);
++        main_loop_wait(true);
++        puts("PASS device removal with native in-flight callback touching its owned buffer during cancel, no stale BH"); return 0;
++    }
++    if(!strcmp(mode,"input-invalid")) {
++        dispatch_sync(shim_queue,^{uint8_t data[60]={0}; shim_input(shim_context,0,NULL,kIOHIDReportTypeInput,255,data,60);});
++        main_loop_wait(true); g_assert_false(d->attached); g_assert_false(s->live);
++        review_destroy(d); puts("PASS invalid native input ID fails closed"); return 0;
++    }
++    fprintf(stderr,"unknown case %s\n",mode); return 64;
++}
+--- /dev/null
++++ b/tests/unit/review-test-base.inc
+@@ -0,0 +1,326 @@
++int original_test_main(void);
++#define main original_test_main
++/* Diskless test: production USB core, fake native device only. */
++#include "qemu/osdep.h"
++static const uint8_t fixture[] = {0x06,0x00,0xff,0x09,0x01,0xa1,0x01,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x3c,0x09,0x01,0x81,0x02,0x95,0x3c,0x09,0x01,0x91,0x02,0x95,0x01,0x09,0x01,0xb1,0x02,0xc0};
++static int opened, closed;
++static bool hold_report;
++static bool use_numbered, fail_report;
++#ifdef HOST_HID_NATIVE_SHIM
++#ifdef HOST_HID_SCOPE_SHIM
++#include "scope-registry-shim.h"
++#else
++#include "review-native-shim.h"
++#endif
++#else
++#define HOST_HID_TEST 1
++#endif
++#include "../../hw/usb/dev-host-hid.c"
++#include "system/system.h"
++#ifndef HOST_HID_NATIVE_SHIM
++static bool native_open(HostHIDState *s, Error **errp)
++{
++    memcpy(s->report_desc, fixture, sizeof(fixture));
++    s->report_desc_len = sizeof(fixture);
++    if (use_numbered) {
++        memmove(s->report_desc+9,s->report_desc+7,sizeof(fixture)-7);
++        s->report_desc[7]=0x85; s->report_desc[8]=7;
++        s->report_desc_len+=2;
++    }
++    s->product = g_strdup("BaldurBootLoader");
++    opened++;
++    return true;
++}
++static void native_close(HostHIDState *s) { closed++; }
++static void native_start(HostHIDState *s) {}
++static int native_report(HostHIDState *s, bool set, unsigned type,
++                         unsigned id, uint8_t *data, unsigned len)
++{
++    if (fail_report) return USB_RET_STALL;
++    g_assert_cmpuint(id,==,use_numbered?7:0);
++    g_assert_cmpuint(type,<=,2);
++    g_assert_cmpuint(len,==,(type==2?1:60)+(use_numbered?1:0));
++    if (set) {
++        g_assert_cmpuint(type,>=,1);
++        for (unsigned i=!!id;i<len;i++) g_assert_cmphex(data[i],==,0x5a);
++    } else {
++        memset(data+!!id,0xa5,len-!!id);
++    }
++    if (!hold_report) host_hid_complete(s,len);
++    return USB_RET_ASYNC;
++}
++#endif
++static void port_noop(USBPort *p) {}
++static void complete_noop(USBPort *p, USBPacket *packet) {}
++static USBPortOps pops = {.attach=port_noop,.detach=port_noop,.complete=complete_noop};
++static USBBusOps bops;
++static int packet(USBDevice *d, int pid, int ep, uint8_t *data, int n, int *actual)
++{
++    USBPacket p;
++    usb_packet_init(&p);
++    usb_packet_setup(&p,pid,usb_ep_get(d,pid,ep),0,1,false,false);
++    usb_packet_addbuf(&p,data,n);
++    usb_handle_packet(d,&p);
++    if (p.status == USB_RET_ASYNC) {
++        while (usb_packet_is_inflight(&p)) main_loop_wait(false);
++    }
++    int status=p.status;
++    *actual=p.actual_length;
++    usb_packet_cleanup(&p);
++    return status;
++}
++static int control(USBDevice *d,int req,int value,int index,uint8_t *data,int n,int *actual)
++{
++    uint8_t setup[8]={req>>8,req,value,value>>8,index,index>>8,n,n>>8};
++    int a, r=packet(d,USB_TOKEN_SETUP,0,setup,8,&a);
++    if(r) return r;
++    *actual=0;
++    while(*actual<n) {
++        int chunk=MIN(64,n-*actual), got;
++        r=packet(d,(req&0x8000)?USB_TOKEN_IN:USB_TOKEN_OUT,0,data+*actual,chunk,&got);
++        if(r) return r;
++        *actual+=got;
++        if(got<chunk) break;
++    }
++    return packet(d,(req&0x8000)?USB_TOKEN_OUT:USB_TOKEN_IN,0,NULL,0,&a);
++}
++static void parser_checks(void)
++{
++    HostHIDState *s=g_new0(HostHIDState,1);
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc_len=sizeof(fixture);
++    g_assert_true(host_hid_parse(s, NULL));
++    g_assert_cmpuint(s->sizes[0][0],==,60);
++    g_assert_cmpuint(s->sizes[1][0],==,60);
++    g_assert_cmpuint(s->sizes[2][0],==,1);
++    for(size_t i=0;i<sizeof(fixture);i++) {
++        s->report_desc_len=i; g_assert_false(host_hid_parse(s, NULL));
++    }
++    s->report_desc_len=sizeof(fixture);
++    s->report_desc[2]=1; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc[15]=255; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    s->report_desc[7]=0xa4; g_assert_false(host_hid_parse(s, NULL));
++    memcpy(s->report_desc,fixture,sizeof(fixture));
++    memmove(s->report_desc+22,s->report_desc+20,sizeof(fixture)-20);
++    s->report_desc[20]=0x85; s->report_desc[21]=7; s->report_desc_len+=2;
++    g_assert_false(host_hid_parse(s, NULL));
++    uint32_t seed=123;
++    for(unsigned i=0;i<20000;i++) {
++        s->report_desc_len=i%sizeof(s->report_desc);
++        for(size_t j=0;j<s->report_desc_len;j++) {
++            seed=seed*1664525+1013904223; s->report_desc[j]=seed>>24;
++        }
++        host_hid_parse(s, NULL);
++    }
++    g_free(s);
++    puts("PASS: vendor-only descriptor policy, truncation, overflow, mixed IDs, 20000 deterministic malformed descriptors");
++}
++static void *deliver_input(void *opaque)
++{
++    uint8_t data[61]; memset(data,0x42,sizeof(data)); data[0]=7;
++    host_hid_receive(opaque,7,data,sizeof(data));
++    return NULL;
++}
++static void native_policy_checks(USBBus *bus)
++{
++#ifdef HOST_HID_NATIVE_SHIM
++    int before=opened;
++    for(int mode=0;mode<5;mode++) {
++        USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++        qdev_prop_set_uint64(&d->qdev,"registry-id",mode==4?0:1000+mode);
++        qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++        qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++        qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++        shim_interfaces=mode==0?2:1; shim_protocol=mode==1?1:0;
++        shim_wrong_identity=mode==2; shim_denied=mode==3;
++        Error *err=NULL;
++        bool ok=qdev_realize(&d->qdev,&bus->qbus,&err);
++        g_assert_false(ok); g_assert_nonnull(err);
++        printf("PASS: native admission rejection %d: %s\n",mode,error_get_pretty(err));
++        error_free(err); object_unref(d);
++    }
++    shim_interfaces=1; shim_protocol=shim_denied=0; shim_wrong_identity=false;
++    g_assert_cmpint(opened,==,before);
++#endif
++}
++int (*qemu_main)(void);
++int main(void)
++{
++    const char *args[]={"host-hid-test","-machine","none","-accel","qtest","-nodefaults","-no-user-config","-display","none","-net","none","-S",NULL};
++    char *argv[13];
++    for (int i=0;i<13;i++) argv[i]=g_strdup(args[i]);
++    qemu_init(12,argv);
++    parser_checks();
++    USBBus bus;
++    USBPort ports[2];
++    DeviceState *host=qdev_new("usb-hub");
++    usb_bus_new(&bus,sizeof(bus),&bops,host);
++    for(int i=0;i<2;i++) usb_register_port(&bus,&ports[i],NULL,i,&pops,USB_SPEED_MASK_FULL);
++    native_policy_checks(&bus);
++    USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",123);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort);
++    usb_device_reset(d);
++    uint8_t buf[256]={0}; int n;
++    g_assert_cmpint(control(d,0x8006,0x100,0,buf,18,&n),==,0);
++    g_assert_cmpint(n,==,18);
++    g_assert_cmphex(buf[8]|buf[9]<<8,==,0xc251);
++    g_assert_cmpint(control(d,0x8006,0x200,0,buf,sizeof(buf),&n),==,0);
++    const uint8_t types[]={2,4,0x21,5,5};
++    int pos=0;
++    for(unsigned i=0;i<ARRAY_SIZE(types);i++) {
++        g_assert_cmpint(buf[pos],>=,2);
++        g_assert_cmpint(pos+buf[pos],<=,n);
++        g_assert_cmpint(buf[pos+1],==,types[i]);
++        if(types[i]==4) g_assert_cmpint(buf[pos+5],==,3);
++        if(types[i]==5) { g_assert_cmpint(buf[pos+3],==,3); g_assert_cmpint(buf[pos+4],==,64); }
++        pos+=buf[pos];
++    }
++    g_assert_cmpint(pos,==,n); g_assert_cmpint(buf[2]|buf[3]<<8,==,n);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0x8106,0x2200,0,buf,sizeof(buf),&n),==,0);
++    g_assert_cmpint(n,==,sizeof(fixture));
++    g_assert_cmpmem(buf,n,fixture,sizeof(fixture));
++    memset(buf,0x5a,60);
++    g_assert_cmpint(control(d,0x2109,0x200,0,buf,60,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    g_assert_cmpint(control(d,0x2109,0x300,0,buf,1,&n),==,0);
++    g_assert_cmpint(control(d,0xa101,0x100,0,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60); g_assert_cmphex(buf[59],==,0xa5);
++    g_assert_cmpint(control(d,0xa101,0x200,0,buf,60,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    g_assert_cmpint(control(d,0xa101,0x300,0,buf,1,&n),==,0);
++    g_assert_cmpint(n,==,1);
++    g_assert_cmphex(buf[0],==,0xa5);
++    g_assert_cmpint(control(d,0x2109,0x200,0,buf,61,&n),==,USB_RET_STALL);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    memset(buf,0x7c,60);
++    host_hid_receive(HOST_HID(d),0,buf,60);
++    main_loop_wait(true);
++    memset(buf,0,64);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,32,&n),==,USB_RET_BABBLE);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,60);
++    for(int i=0;i<60;i++) g_assert_cmphex(buf[i],==,0x7c);
++    g_assert_cmpint(control(d,0x0203,0,0x81,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0x8200,0,0x81,buf,2,&n),==,0);
++    g_assert_cmpint(n,==,2); g_assert_cmpint(buf[0],==,1);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x0201,0,0x81,buf,0,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    host_hid_receive(HOST_HID(d),0,buf,60);
++    usb_device_reset(d);
++    g_assert_cmpint(control(d,0x8008,0,0,buf,1,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,USB_RET_NAK);
++    /* Invalid standard fields must not silently mutate the virtual bus. */
++    g_assert_cmpint(control(d,0x0005,128,0,buf,0,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x0009,1,1,buf,0,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x8000,0,1,buf,2,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0x8200,0,0,buf,2,&n),==,0);
++    g_assert_cmpint(control(d,0x8100,0,0,buf,2,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x210a,0,0,buf,0,&n),==,0);
++    g_assert_cmpint(control(d,0xa102,0,0,buf,1,&n),==,0);
++    g_assert_cmpint(buf[0],==,0);
++    g_assert_cmpint(control(d,0x210b,1,0,buf,0,&n),==,USB_RET_STALL);
++    g_free(HOST_HID(d)->product);
++    HOST_HID(d)->product=g_strdup("Baldur \xc5\xbd");
++    HOST_HID(d)->strings[1]=HOST_HID(d)->product;
++    g_assert_cmpint(control(d,0x8006,0x0301,0x409,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,18);
++    g_assert_cmphex(buf[16]|buf[17]<<8,==,0x017d);
++    hold_report=true;
++    USBPacket held;
++    usb_packet_init(&held);
++    memset(buf,0x5a,60);
++    usb_packet_setup(&held,USB_TOKEN_OUT,usb_ep_get(d,USB_TOKEN_OUT,1),0,10,false,false);
++    usb_packet_addbuf(&held,buf,60);
++    usb_handle_packet(d,&held);
++    g_assert_cmpint(held.status,==,USB_RET_ASYNC);
++    usb_device_reset(d);
++    g_assert_false(usb_packet_is_inflight(&held));
++    g_assert_cmpint(held.status,==,USB_RET_STALL);
++    usb_packet_cleanup(&held);
++    host_hid_complete(HOST_HID(d),60);
++    main_loop_wait(true);
++    g_assert_false(HOST_HID(d)->busy);
++    hold_report=false;
++    qdev_unrealize(&d->qdev);
++    object_unref(d);
++    g_assert_cmpint(opened,==,1); g_assert_cmpint(closed,==,1);
++    puts("PASS: real EP0 enumeration, unnumbered 60-byte OUT/IN, feature1, UTF16 strings, halt/clear/reset, cancellation and release");
++    use_numbered=true;
++    d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",124);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort); usb_device_reset(d);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    memset(buf,0x5a,61); buf[0]=7;
++    g_assert_cmpint(control(d,0x2109,0x207,0,buf,61,&n),==,0);
++    g_assert_cmpint(packet(d,USB_TOKEN_OUT,1,buf,61,&n),==,0);
++    g_assert_cmpint(n,==,61);
++    g_assert_cmpint(control(d,0xa101,0x307,0,buf,2,&n),==,0);
++    g_assert_cmpint(n,==,2); g_assert_cmpint(buf[0],==,7); g_assert_cmpint(buf[1],==,0xa5);
++    g_assert_cmpint(control(d,0x2109,0x207,0,buf,60,&n),==,USB_RET_STALL);
++    g_assert_cmpint(control(d,0xa101,0x308,0,buf,2,&n),==,USB_RET_STALL);
++    QemuThread thread;
++    qemu_thread_create(&thread,"fake-hid-callback",deliver_input,HOST_HID(d),QEMU_THREAD_JOINABLE);
++    qemu_thread_join(&thread); main_loop_wait(true);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,61); g_assert_cmpint(buf[0],==,7); g_assert_cmpint(buf[60],==,0x42);
++    fail_report=true;
++    g_assert_cmpint(control(d,0xa101,0x307,0,buf,2,&n),==,USB_RET_STALL);
++    g_assert_false(HOST_HID(d)->busy); fail_report=false;
++#ifdef HOST_HID_NATIVE_SHIM
++    uint8_t native_data[61]; memset(native_data,0x42,61); native_data[0]=7;
++    uint8_t *native_pointer=native_data;
++    dispatch_sync(shim_queue,^{shim_input(shim_context,0,NULL,kIOHIDReportTypeInput,7,native_pointer,61);});
++    main_loop_wait(true);
++    g_assert_cmpint(packet(d,USB_TOKEN_IN,1,buf,64,&n),==,0);
++    g_assert_cmpint(n,==,61);
++#endif
++    for(int i=0;i<17;i++) deliver_input(HOST_HID(d));
++    main_loop_wait(true);
++    g_assert_false(HOST_HID(d)->live); g_assert_false(d->attached);
++    deliver_input(HOST_HID(d)); main_loop_wait(true);
++    g_assert_false(d->attached);
++    qdev_unrealize(&d->qdev); object_unref(d);
++    g_assert_cmpint(opened,==,2); g_assert_cmpint(closed,==,2);
++    puts("PASS: numbered 61-byte reports, cross-thread callback, error cleanup, overflow fail-closed, no automatic reattach");
++#ifdef HOST_HID_NATIVE_SHIM
++    d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",125);
++    qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);
++    qdev_prop_set_uint16(&d->qdev,"productid",0x1701);
++    qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    qdev_realize(&d->qdev,&bus.qbus,&error_abort); usb_device_reset(d);
++    g_assert_cmpint(control(d,0x0009,1,0,buf,0,&n),==,0);
++    hold_report=true;
++    usb_packet_init(&held); memset(buf,0x5a,61); buf[0]=7;
++    usb_packet_setup(&held,USB_TOKEN_OUT,usb_ep_get(d,USB_TOKEN_OUT,1),0,20,false,false);
++    usb_packet_addbuf(&held,buf,61); usb_handle_packet(d,&held);
++    g_assert_cmpint(held.status,==,USB_RET_ASYNC);
++    dispatch_sync(shim_queue,^{shim_removed(shim_context,0,NULL);});
++    main_loop_wait(true);
++    g_assert_false(d->attached);
++    g_assert_false(usb_packet_is_inflight(&held));
++    g_assert_cmpint(held.status,==,USB_RET_STALL);
++    usb_packet_cleanup(&held);
++    qdev_unrealize(&d->qdev); object_unref(d); hold_report=false;
++    g_assert_cmpint(opened,==,3); g_assert_cmpint(closed,==,3);
++    puts("PASS: native removal while OUT pending completes/stalls before detach; dispatch cancellation drained before release");
++#endif
++    return 0;
++}
++
++#undef main
+--- /dev/null
++++ b/tests/unit/review-native-shim.h
+@@ -0,0 +1,143 @@
++/* No-hardware IOKit API boundary. Real CF objects and libdispatch scheduling.
++ * Every native IOKit symbol referenced by dev-host-hid.c is replaced here. */
++#include <IOKit/IOKitLib.h>
++#include <IOKit/hid/IOHIDDevice.h>
++#include <dispatch/dispatch.h>
++#include <Block.h>
++static uint64_t shim_id;
++static IOReturn review_result;
++static int review_length_delta, review_registry_delta, review_no_service;
++static int review_open_attempts, review_get_calls, review_set_calls;
++static bool review_hold_get, review_complete_on_cancel;
++static IOHIDReportCallback review_pending_cb;
++static void *review_pending_ctx;
++static uint8_t *review_pending_data;
++static CFIndex review_pending_len;
++static IOHIDReportType review_pending_type;
++static CFIndex review_pending_id;
++static IOHIDDeviceRef review_pending_device;
++static int shim_interfaces=1, shim_protocol, shim_cursor, shim_denied;
++static bool shim_wrong_identity;
++static dispatch_queue_t shim_queue;
++static dispatch_block_t shim_cancel;
++static IOHIDReportCallback shim_input;
++static IOHIDCallback shim_removed;
++static void *shim_context;
++static CFMutableDictionaryRef shim_matching(uint64_t id)
++{
++    shim_id=id;
++    return CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++}
++static io_service_t shim_service(mach_port_t port, CFDictionaryRef match)
++{ CFRelease(match); return review_no_service?0:1; }
++static kern_return_t shim_registry(io_registry_entry_t e, uint64_t *id)
++{ *id=shim_id+review_registry_delta; return KERN_SUCCESS; }
++static boolean_t shim_conforms(io_object_t e, const io_name_t name)
++{
++    return (e==1 && !strcmp(name,"IOHIDDevice")) ||
++           (e==2 && !strcmp(name,"IOUSBHostDevice")) ||
++           (e>=3 && e<20 && !strcmp(name,"IOUSBHostInterface"));
++}
++static kern_return_t shim_parent(io_registry_entry_t e,const io_name_t plane,io_registry_entry_t *parent)
++{ *parent=2; return e==1?KERN_SUCCESS:KERN_FAILURE; }
++static kern_return_t shim_retain(io_object_t e) { return KERN_SUCCESS; }
++static kern_return_t shim_release(io_object_t e) { return KERN_SUCCESS; }
++static kern_return_t shim_iterator(io_registry_entry_t e,const io_name_t plane,IOOptionBits options,io_iterator_t *it)
++{ g_assert_cmpint(e,==,2); *it=100; shim_cursor=0; return KERN_SUCCESS; }
++static io_object_t shim_next(io_iterator_t it)
++{ return shim_cursor<shim_interfaces?3+shim_cursor++:0; }
++static CFTypeRef shim_registry_prop(io_registry_entry_t e,CFStringRef key,CFAllocatorRef allocator,IOOptionBits options)
++{
++    int n=CFEqual(key,CFSTR("bInterfaceClass"))?3:CFEqual(key,CFSTR("bInterfaceProtocol"))?shim_protocol:0;
++    return CFNumberCreate(NULL,kCFNumberIntType,&n);
++}
++static IOHIDDeviceRef shim_create(CFAllocatorRef allocator,io_service_t service)
++{
++    CFMutableDictionaryRef d=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++    CFDictionarySetValue(d,CFSTR(kIOHIDSerialNumberKey),CFSTR("tFIXTUR0E123"));
++    CFDictionarySetValue(d,CFSTR(kIOHIDProductKey),CFSTR("BaldurBootLoader"));
++    CFDictionarySetValue(d,CFSTR(kIOHIDTransportKey),CFSTR("USB"));
++    int v=shim_wrong_identity?1:0xc251, p=0x1701;
++    CFNumberRef vendor=CFNumberCreate(NULL,kCFNumberIntType,&v), product=CFNumberCreate(NULL,kCFNumberIntType,&p);
++    CFDictionarySetValue(d,CFSTR(kIOHIDVendorIDKey),vendor); CFRelease(vendor);
++    CFDictionarySetValue(d,CFSTR(kIOHIDProductIDKey),product); CFRelease(product);
++    uint8_t desc[sizeof(fixture)+2]; memcpy(desc,fixture,sizeof(fixture));
++    if(use_numbered) { memmove(desc+9,desc+7,sizeof(fixture)-7); desc[7]=0x85; desc[8]=7; }
++    CFDataRef report=CFDataCreate(NULL,desc,sizeof(fixture)+(use_numbered?2:0));
++    CFDictionarySetValue(d,CFSTR(kIOHIDReportDescriptorKey),report); CFRelease(report);
++    return (IOHIDDeviceRef)d;
++}
++static CFTypeRef shim_prop(IOHIDDeviceRef d,CFStringRef key)
++{ return CFDictionaryGetValue((CFDictionaryRef)d,key); }
++static IOReturn shim_open(IOHIDDeviceRef d,IOOptionBits options)
++{ g_assert_cmpuint(options,==,kIOHIDOptionsTypeNone); review_open_attempts++; if(shim_denied) return kIOReturnNotPermitted; opened++; return 0; }
++static IOReturn shim_close(IOHIDDeviceRef d,IOOptionBits options)
++{ closed++; return 0; }
++static void shim_set_queue(IOHIDDeviceRef d,dispatch_queue_t queue) { shim_queue=queue; }
++static void shim_set_cancel(IOHIDDeviceRef d,dispatch_block_t block) { shim_cancel=Block_copy(block); }
++static void shim_activate(IOHIDDeviceRef d) {}
++static void shim_cancel_device(IOHIDDeviceRef d)
++{
++    if (review_complete_on_cancel && review_pending_cb) {
++        dispatch_async(shim_queue,^{
++            g_assert_nonnull(review_pending_data);
++            review_pending_data[review_pending_len-1]=0x5a;
++            review_pending_cb(review_pending_ctx,kIOReturnAborted,review_pending_device,review_pending_type,review_pending_id,review_pending_data,review_pending_len);
++        });
++    }
++    dispatch_async(shim_queue,shim_cancel); Block_release(shim_cancel); shim_cancel=NULL;
++}
++static void shim_register_input(IOHIDDeviceRef d,uint8_t *report,CFIndex len,IOHIDReportCallback cb,void *ctx)
++{ g_assert_cmpint(len,==,64); shim_input=cb; shim_context=ctx; }
++static void shim_register_removal(IOHIDDeviceRef d,IOHIDCallback cb,void *ctx)
++{ shim_removed=cb; }
++static IOReturn shim_set_report(IOHIDDeviceRef d,IOHIDReportType type,CFIndex id,const uint8_t *data,CFIndex len,CFTimeInterval timeout,IOHIDReportCallback callback,void *ctx)
++{
++    review_set_calls++;
++    if(fail_report) return kIOReturnError;
++    g_assert_cmpuint(id,==,use_numbered?7:0); g_assert_cmpuint(type,>=,1); g_assert_cmpuint(type,<=,2);
++    g_assert_cmpint(len,==,(type==2?1:60)+(use_numbered?1:0)); g_assert_cmpint(timeout,==,1000);
++    for(CFIndex i=!!id;i<len;i++) g_assert_cmphex(data[i],==,0x5a);
++    if(hold_report) {
++        review_pending_cb=callback; review_pending_ctx=ctx; review_pending_device=d;
++        review_pending_data=(uint8_t *)data; review_pending_len=len;
++        review_pending_type=type; review_pending_id=id;
++    } else dispatch_async(shim_queue,^{callback(ctx,review_result,d,type,id,(uint8_t *)data,len+review_length_delta);});
++    return 0;
++}
++static IOReturn shim_get_report(IOHIDDeviceRef d,IOHIDReportType type,CFIndex id,uint8_t *data,CFIndex *length,CFTimeInterval timeout,IOHIDReportCallback callback,void *ctx)
++{
++    review_get_calls++;
++    if(fail_report) return kIOReturnError;
++    CFIndex len=*length;
++    g_assert_cmpuint(id,==,use_numbered?7:0); g_assert_cmpuint(type,<=,2);
++    g_assert_cmpint(len,==,(type==2?1:60)+(use_numbered?1:0)); g_assert_cmpint(timeout,==,1000);
++    if(review_hold_get) {
++        review_pending_cb=callback; review_pending_ctx=ctx; review_pending_device=d;
++        review_pending_data=data; review_pending_len=len;
++        review_pending_type=type; review_pending_id=id;
++    } else dispatch_async(shim_queue,^{memset(data+!!id,0xa5,len-!!id); callback(ctx,review_result,d,type,id,data,len+review_length_delta);});
++    return 0;
++}
++#define IORegistryEntryIDMatching shim_matching
++#define IOServiceGetMatchingService shim_service
++#define IORegistryEntryGetRegistryEntryID shim_registry
++#define IOObjectConformsTo shim_conforms
++#define IORegistryEntryGetParentEntry shim_parent
++#define IOObjectRetain shim_retain
++#define IOObjectRelease shim_release
++#define IORegistryEntryCreateIterator shim_iterator
++#define IOIteratorNext shim_next
++#define IORegistryEntryCreateCFProperty shim_registry_prop
++#define IOHIDDeviceCreate shim_create
++#define IOHIDDeviceGetProperty shim_prop
++#define IOHIDDeviceOpen shim_open
++#define IOHIDDeviceClose shim_close
++#define IOHIDDeviceSetDispatchQueue shim_set_queue
++#define IOHIDDeviceSetCancelHandler shim_set_cancel
++#define IOHIDDeviceActivate shim_activate
++#define IOHIDDeviceCancel shim_cancel_device
++#define IOHIDDeviceRegisterInputReportCallback shim_register_input
++#define IOHIDDeviceRegisterRemovalCallback shim_register_removal
++#define IOHIDDeviceSetReportWithCallback shim_set_report
++#define IOHIDDeviceGetReportWithCallback shim_get_report
+--- /dev/null
++++ b/tests/unit/test-host-hid-review.c
+@@ -0,0 +1,190 @@
++/* Review regressions: real USB core, exact production source, no native I/O. */
++#include "review-test-base.inc"
++
++static USBDevice *make_device(USBBus *bus)
++{
++    USBDevice *d = USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev, "registry-id", 123);
++    qdev_prop_set_uint16(&d->qdev, "vendorid", 0xc251);
++    qdev_prop_set_uint16(&d->qdev, "productid", 0x1701);
++    qdev_prop_set_string(&d->qdev, "serial", "tFIXTUR0E123");
++    qdev_realize(&d->qdev, &bus->qbus, &error_abort);
++    usb_device_reset(d);
++    int n, r = control(d, 0x0009, 1, 0, NULL, 0, &n);
++    g_assert_cmpint(r, ==, 0);
++    return d;
++}
++static void start_packet(USBDevice *d, USBPacket *p, int pid, int ep,
++                         uint8_t *data, size_t len, uint64_t parameter)
++{
++    usb_packet_init(p);
++    usb_packet_setup(p, pid, usb_ep_get(d, pid, ep), 0, 99, false, false);
++    usb_packet_addbuf(p, data, len);
++    p->parameter = parameter;
++    usb_handle_packet(d, p);
++}
++static void finish_native(IOReturn status, CFIndex length)
++{
++    dispatch_sync(shim_queue, ^{
++        review_pending_cb(review_pending_ctx, status, review_pending_device,
++                          review_pending_type, review_pending_id,
++                          review_pending_data, length);
++    });
++    review_pending_cb = NULL;
++}
++static void wait_packet(USBPacket *p)
++{
++    while (usb_packet_is_inflight(p)) { main_loop_wait(false); }
++}
++int main(void)
++{
++    const char *mode = getenv("REVIEW_CASE");
++    g_assert_nonnull(mode);
++    const char *args[] = {"hid-regression", "-machine", "none", "-accel", "qtest",
++        "-nodefaults", "-no-user-config", "-display", "none", "-net", "none", "-S", NULL};
++    char *argv[13];
++    for (int i = 0; i < 13; i++) { argv[i] = g_strdup(args[i]); }
++    qemu_init(12, argv);
++    USBBus bus; USBPort ports[2];
++    DeviceState *host = qdev_new("usb-hub");
++    usb_bus_new(&bus, sizeof(bus), &bops, host);
++    for (int i = 0; i < 2; i++) {
++        usb_register_port(&bus, &ports[i], NULL, i, &pops, USB_SPEED_MASK_FULL);
++    }
++    USBDevice *d = make_device(&bus);
++    uint8_t data[60], reply[60] = {0};
++    memset(data, 0x5a, sizeof(data));
++    int n, r;
++    if (!strcmp(mode, "callback-boundaries")) {
++        const IOReturn failures[] = {kIOReturnTimeout, kIOReturnAborted, kIOReturnError};
++        review_length_delta = -60;
++        for (unsigned i = 0; i < ARRAY_SIZE(failures); i++) {
++            review_result = failures[i];
++            r = packet(d, USB_TOKEN_OUT, 1, data, 60, &n);
++            g_assert_cmpint(r, ==, USB_RET_STALL); g_assert_cmpint(n, ==, 0);
++            r = control(d, 0x2109, 0x200, 0, data, 60, &n);
++            g_assert_cmpint(r, ==, USB_RET_STALL);
++        }
++        review_result = 0; review_length_delta = 0; review_hold_get = true;
++        const CFIndex lengths[] = {-1, 0, 59, 60, 61, 64, 65,
++                                    ((CFIndex)1 << 32) + 60};
++        for (unsigned i = 0; i < ARRAY_SIZE(lengths); i++) {
++            uint8_t setup[] = {0xa1,1,0,1,0,0,60,0};
++            USBPacket ctl;
++            start_packet(d, &ctl, USB_TOKEN_SETUP, 0, setup, 8, 0);
++            g_assert_cmpint(ctl.status, ==, USB_RET_ASYNC);
++            finish_native(0, lengths[i]); wait_packet(&ctl);
++            g_assert_cmpint(ctl.status, ==, lengths[i] == 60 ? 0 : USB_RET_STALL);
++            usb_packet_cleanup(&ctl);
++        }
++    } else if (!strcmp(mode, "out-retry")) {
++        review_hold_get = true;
++        uint8_t setup[] = {0xa1,1,0,1,0,0,60,0};
++        USBPacket ctl, out;
++        start_packet(d, &ctl, USB_TOKEN_SETUP, 0, setup, 8, 0);
++        g_assert_cmpint(ctl.status, ==, USB_RET_ASYNC);
++        start_packet(d, &out, USB_TOKEN_OUT, 1, data, 60, 0);
++        for (int i = 0; i < 3; i++) {
++            g_assert_cmpint(out.status, ==, USB_RET_NAK);
++            g_assert_cmpint(out.actual_length, ==, 0);
++            usb_handle_packet(d, &out); /* EHCI reuses SETUP-state packet. */
++        }
++        finish_native(0, 60); wait_packet(&ctl);
++        g_assert_cmpint(ctl.status, ==, 0); usb_packet_cleanup(&ctl);
++        review_hold_get = false;
++        review_length_delta = -60;
++        usb_handle_packet(d, &out); wait_packet(&out);
++        g_assert_cmpint(out.status, ==, 0);
++        g_assert_cmpint(out.actual_length, ==, 60);
++        g_assert_cmpint(review_set_calls, ==, 1);
++        usb_packet_cleanup(&out);
++    } else {
++        /* An in-flight EP1 operation must not force EP0 through a lossy NAK. */
++        USBPacket out, ctl;
++        hold_report = true;
++        start_packet(d, &out, USB_TOKEN_OUT, 1, data, 60, 0);
++        g_assert_cmpint(out.status, ==, USB_RET_ASYNC);
++        USBPacket queued;
++        bool queued_out = !strcmp(mode, "control-queued-out");
++        if (queued_out) {
++            start_packet(d, &queued, USB_TOKEN_OUT, 1, data, 60, 0);
++            g_assert_cmpint(queued.status, ==, USB_RET_ASYNC);
++        }
++        bool get = strstr(mode, "get") != NULL;
++        bool xhci = strstr(mode, "xhci") != NULL;
++        if (xhci) {
++            start_packet(d, &ctl, get ? USB_TOKEN_IN : USB_TOKEN_OUT, 0,
++                         get ? reply : data, 60, get ? UINT64_C(0x003c0000010001a1) :
++                                                    UINT64_C(0x003c000002000921));
++        } else if (get) {
++            uint8_t setup[] = {0xa1,1,0,1,0,0,60,0};
++            start_packet(d, &ctl, USB_TOKEN_SETUP, 0, setup, 8, 0);
++        } else {
++            uint8_t setup[] = {0x21,9,0,2,0,0,60,0};
++            r = packet(d, USB_TOKEN_SETUP, 0, setup, 8, &n);
++            g_assert_cmpint(r, ==, 0);
++            r = packet(d, USB_TOKEN_OUT, 0, data, 60, &n);
++            g_assert_cmpint(r, ==, 0);
++            start_packet(d, &ctl, USB_TOKEN_IN, 0, NULL, 0, 0);
++        }
++        g_assert_cmpint(ctl.status, ==, USB_RET_ASYNC);
++        g_assert_cmpint(review_set_calls, ==, 1);
++        g_assert_cmpint(review_get_calls, ==, 0);
++        bool aborting = false;
++        if (!strcmp(mode, "control-cancel") || !strcmp(mode, "control-delete")) {
++            usb_cancel_packet(&ctl); aborting = true;
++        } else if (!strcmp(mode, "control-reset")) {
++            usb_device_reset(d); aborting = true;
++        } else if (!strcmp(mode, "control-config")) {
++            /* A new SETUP requires the controller to cancel the old EP0. */
++            usb_cancel_packet(&ctl);
++            r = control(d, 0x0009, 0, 0, NULL, 0, &n);
++            g_assert_cmpint(r, ==, 0); aborting = true;
++        } else if (!strcmp(mode, "control-remove")) {
++            dispatch_sync(shim_queue, ^{ shim_removed(shim_context, 0, NULL); });
++            main_loop_wait(true); aborting = true;
++        }
++        if (!strcmp(mode, "control-delete")) {
++            usb_cancel_packet(&out);
++            review_complete_on_cancel = true;
++        } else {
++            hold_report = false;
++            /* Force real native SET length zero, but retain GET's exact size. */
++            review_length_delta = get ? 0 : -60;
++            if (!strcmp(mode, "control-native-error")) { fail_report = true; }
++            finish_native(0, 0); wait_packet(&out);
++            if (aborting) {
++                g_assert_false(usb_packet_is_inflight(&ctl));
++                g_assert_cmpint(review_set_calls, ==, 1);
++                g_assert_cmpint(review_get_calls, ==, 0);
++                main_loop_wait(true);
++            } else {
++                wait_packet(&ctl);
++                g_assert_cmpint(ctl.status, ==,
++                    fail_report ? USB_RET_STALL : USB_RET_SUCCESS);
++                g_assert_cmpint(review_get_calls, ==, get ? 1 : 0);
++                g_assert_cmpint(review_set_calls, ==, get ? 1 : queued_out ? 3 : 2);
++                if (!fail_report && get) {
++                    if (!xhci) {
++                        g_assert_cmpint(ctl.actual_length, ==, 8);
++                        r = packet(d, USB_TOKEN_IN, 0, reply, 60, &n);
++                        g_assert_cmpint(r, ==, 0); g_assert_cmpint(n, ==, 60);
++                        r = packet(d, USB_TOKEN_OUT, 0, NULL, 0, &n);
++                        g_assert_cmpint(r, ==, 0);
++                    } else { g_assert_cmpint(ctl.actual_length, ==, 60); }
++                    for (int i = 0; i < 60; i++) { g_assert_cmphex(reply[i], ==, 0xa5); }
++                }
++            }
++        }
++        usb_packet_cleanup(&ctl); usb_packet_cleanup(&out);
++        if (queued_out) {
++            g_assert_cmpint(queued.status, ==, 0);
++            g_assert_cmpint(queued.actual_length, ==, 60);
++            usb_packet_cleanup(&queued);
++        }
++    }
++    qdev_unrealize(&d->qdev); object_unref(d);
++    main_loop_wait(true);
++    puts(mode); puts("PASS: review regression, no native IOKit symbols");
++    return 0;
++}
+--- /dev/null
++++ b/tests/unit/scope-registry-shim.h
+@@ -0,0 +1,132 @@
++/* Test-only registry graph: real CF values, no native calls. */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wunused-function"
++#include "review-native-shim.h"
++static struct {
++    const char *cls;
++    unsigned parent;
++    CFMutableDictionaryRef props;
++    bool unreadable;
++} scope_nodes[80];
++static unsigned scope_count, scope_reads, scope_created, scope_create_reads;
++static bool scope_invalid, scope_class_fail, scope_parent_fail;
++static struct { unsigned nodes[80], count, at; } scope_iter[80];
++static unsigned scope_iters;
++static void scope_num(unsigned n, CFStringRef key, int64_t x)
++{
++    CFNumberRef v=CFNumberCreate(NULL,kCFNumberSInt64Type,&x);
++    CFDictionarySetValue(scope_nodes[n].props,key,v); CFRelease(v);
++}
++static void scope_usage(unsigned n)
++{
++    scope_num(n,CFSTR("PrimaryUsagePage"),0xff00);
++    scope_num(n,CFSTR("PrimaryUsage"),1);
++    CFMutableDictionaryRef p=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++    int page=0xff00,usage=1;
++    CFNumberRef a=CFNumberCreate(NULL,kCFNumberIntType,&page),b=CFNumberCreate(NULL,kCFNumberIntType,&usage);
++    CFDictionarySetValue(p,CFSTR("DeviceUsagePage"),a);CFDictionarySetValue(p,CFSTR("DeviceUsage"),b);
++    const void *values[]={p}; CFArrayRef arr=CFArrayCreate(NULL,values,1,&kCFTypeArrayCallBacks);
++    CFDictionarySetValue(scope_nodes[n].props,CFSTR("DeviceUsagePairs"),arr);
++    CFRelease(arr);CFRelease(p);CFRelease(a);CFRelease(b);
++}
++static unsigned scope_node(const char *cls,unsigned parent)
++{
++    unsigned n=++scope_count;g_assert_cmpuint(n,<,80);
++    scope_nodes[n].cls=cls;scope_nodes[n].parent=parent;
++    scope_nodes[n].props=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++    return n;
++}
++static void scope_init(void)
++{
++    if(scope_count)return;
++    scope_node("AppleUserHIDDevice",3);scope_node("IOUSBHostDevice",0);
++    scope_node("IOUSBHostInterface",2);scope_node("IOHIDInterface",1);
++    scope_node("AppleUSBHostCompositeDevice",2);
++    scope_usage(1);scope_usage(4);
++    scope_num(2,CFSTR("idVendor"),0xc251);scope_num(2,CFSTR("idProduct"),0x1701);scope_num(2,CFSTR("bDeviceClass"),0);
++    CFDataRef descriptor=CFDataCreate(NULL,fixture,sizeof(fixture));
++    CFDictionarySetValue(scope_nodes[1].props,CFSTR("ReportDescriptor"),descriptor);CFRelease(descriptor);
++    scope_num(3,CFSTR("bInterfaceClass"),3);scope_num(3,CFSTR("bInterfaceSubClass"),0);scope_num(3,CFSTR("bInterfaceProtocol"),0);
++}
++static boolean_t scope_conforms(io_object_t e,const io_name_t name)
++{
++    scope_init();
++    if(e==1 && !strcmp(name,"IOHIDDevice"))return true; /* includes specialized negative */
++    return e<=scope_count && !strcmp(scope_nodes[e].cls,name);
++}
++static kern_return_t scope_class(io_object_t e,io_name_t name)
++{
++    scope_reads++;scope_init();if(scope_class_fail || !e || e>scope_count)return KERN_FAILURE;
++    g_strlcpy(name,scope_nodes[e].cls,sizeof(io_name_t));return KERN_SUCCESS;
++}
++static kern_return_t scope_parent(io_registry_entry_t e,const io_name_t p,io_registry_entry_t *out)
++{
++    scope_reads++;scope_init();*out=scope_nodes[e].parent;
++    return *out && !scope_parent_fail?KERN_SUCCESS:KERN_FAILURE;
++}
++static kern_return_t scope_children(io_registry_entry_t e,const io_name_t p,io_iterator_t *out)
++{
++    scope_reads++;scope_init();if(scope_nodes[e].unreadable)return KERN_FAILURE;
++    unsigned k=++scope_iters;g_assert_cmpuint(k,<,80);*out=k+100;
++    for(unsigned n=1;n<=scope_count;n++)if(scope_nodes[n].parent==e)scope_iter[k].nodes[scope_iter[k].count++]=n;
++    return KERN_SUCCESS;
++}
++static kern_return_t scope_recursive(io_registry_entry_t e,const io_name_t p,IOOptionBits o,io_iterator_t *out)
++{
++    scope_reads++;scope_init();unsigned k=++scope_iters;*out=k+100;
++    for(unsigned n=1;n<=scope_count;n++)if(n!=2)scope_iter[k].nodes[scope_iter[k].count++]=n;
++    return KERN_SUCCESS;
++}
++static io_object_t scope_next(io_iterator_t it)
++{ unsigned k=it-100;return scope_iter[k].at<scope_iter[k].count?scope_iter[k].nodes[scope_iter[k].at++]:0; }
++static boolean_t scope_valid(io_iterator_t it){return !scope_invalid;}
++static kern_return_t scope_props(io_registry_entry_t e,CFMutableDictionaryRef *out,CFAllocatorRef a,IOOptionBits o)
++{
++    scope_reads++;scope_init();if(scope_nodes[e].unreadable)return KERN_FAILURE;
++    if(e==3)scope_num(3,CFSTR("bInterfaceProtocol"),shim_protocol);
++    *out=CFDictionaryCreateMutableCopy(NULL,0,scope_nodes[e].props);return KERN_SUCCESS;
++}
++static CFTypeRef scope_prop(io_registry_entry_t e,CFStringRef key,CFAllocatorRef a,IOOptionBits o)
++{
++    scope_reads++;scope_init();if(scope_nodes[e].unreadable)return NULL;
++    if(e==3)scope_num(3,CFSTR("bInterfaceProtocol"),shim_protocol);
++    if(e==1 && use_numbered && CFEqual(key,CFSTR("ReportDescriptor"))) {
++        uint8_t desc[sizeof(fixture)+2];memcpy(desc,fixture,sizeof(fixture));
++        memmove(desc+9,desc+7,sizeof(fixture)-7);desc[7]=0x85;desc[8]=7;
++        return CFDataCreate(NULL,desc,sizeof(desc));
++    }
++    CFTypeRef v=CFDictionaryGetValue(scope_nodes[e].props,key);return v?CFRetain(v):NULL;
++}
++static kern_return_t scope_id(io_registry_entry_t e,uint64_t *id)
++{scope_reads++;*id=e==1?shim_id+review_registry_delta:10000+e;return KERN_SUCCESS;}
++static IOHIDDeviceRef scope_create(CFAllocatorRef a,io_service_t e)
++{scope_created++;scope_create_reads=scope_reads;return shim_create(a,e);}
++static io_service_t scope_service(mach_port_t p,CFDictionaryRef m)
++{
++    static unsigned extra;
++    scope_init();scope_iters=0;memset(scope_iter,0,sizeof(scope_iter));
++    if(extra && shim_interfaces==1){CFRelease(scope_nodes[extra].props);scope_count--;extra=0;}
++    if(shim_interfaces==2 && !extra){unsigned n=scope_node("IOUSBHostInterface",2);extra=n;scope_num(n,CFSTR("bInterfaceClass"),3);scope_num(n,CFSTR("bInterfaceSubClass"),0);scope_num(n,CFSTR("bInterfaceProtocol"),0);}
++    return shim_service(p,m);
++}
++#undef IOServiceGetMatchingService
++#undef IOObjectConformsTo
++#undef IORegistryEntryGetParentEntry
++#undef IORegistryEntryCreateIterator
++#undef IOIteratorNext
++#undef IORegistryEntryCreateCFProperty
++#undef IORegistryEntryGetRegistryEntryID
++#undef IOHIDDeviceCreate
++#define IOServiceGetMatchingService scope_service
++#define IOObjectConformsTo scope_conforms
++#define IOObjectGetClass scope_class
++#define IORegistryEntryGetParentEntry scope_parent
++#define IORegistryEntryCreateIterator scope_recursive
++#define IORegistryEntryGetChildIterator scope_children
++#define IOIteratorNext scope_next
++#define IOIteratorIsValid scope_valid
++#define IORegistryEntryCreateCFProperty scope_prop
++#define IORegistryEntryCreateCFProperties scope_props
++#define IORegistryEntryGetRegistryEntryID scope_id
++#define IOHIDDeviceCreate scope_create
++#pragma clang diagnostic pop
+--- /dev/null
++++ b/tests/unit/scope-test.c
+@@ -0,0 +1,48 @@
++/* Executes unmodified production native_open through a synthetic registry. */
++#define HOST_HID_SCOPE_SHIM 1
++#include "review-test-base.inc"
++int main(void)
++{
++    const char *args[]={"scope","-machine","none","-accel","qtest","-nodefaults","-no-user-config","-display","none","-net","none","-S",NULL};
++    char *argv[13];for(int i=0;i<13;i++)argv[i]=g_strdup(args[i]);qemu_init(12,argv);
++    const char *mode=getenv("REVIEW_CASE");g_assert_nonnull(mode);scope_init();
++    bool allow=!strcmp(mode,"parent-snapshot") || !strcmp(mode,"generic-base") || !strcmp(mode,"false-built-in") || !strcmp(mode,"unrelated-name");
++    if(!strcmp(mode,"generic-base"))scope_nodes[1].cls="IOHIDDevice";
++    if(!strcmp(mode,"false-built-in"))for(unsigned i=1;i<=4;i++)scope_num(i,CFSTR("Built-In"),0);
++    unsigned n=1;const char *dash=strrchr(mode,'-');if(dash && dash[1]>='1' && dash[1]<='5')n=dash[1]-'0';
++    if(g_str_has_prefix(mode,"built-in-"))scope_num(n,CFSTR("Built-In"),1);
++    if(g_str_has_prefix(mode,"boolean-internal-"))CFDictionarySetValue(scope_nodes[n].props,CFSTR("Built-In"),kCFBooleanTrue);
++    if(g_str_has_prefix(mode,"malformed-internal-"))CFDictionarySetValue(scope_nodes[n].props,CFSTR("Built-In"),CFSTR("false"));
++    if(g_str_has_prefix(mode,"standard-page-")){scope_usage(n);scope_num(n,CFSTR("PrimaryUsagePage"),1);}
++    if(g_str_has_prefix(mode,"malformed-page-")){scope_usage(n);CFDictionarySetValue(scope_nodes[n].props,CFSTR("PrimaryUsagePage"),kCFBooleanTrue);}
++    if(g_str_has_prefix(mode,"missing-page-"))CFDictionaryRemoveValue(scope_nodes[n].props,CFSTR("PrimaryUsagePage"));
++    if(g_str_has_prefix(mode,"missing-pairs-"))CFDictionaryRemoveValue(scope_nodes[n].props,CFSTR("DeviceUsagePairs"));
++    if(g_str_has_prefix(mode,"empty-pairs-")){CFArrayRef a=CFArrayCreate(NULL,NULL,0,&kCFTypeArrayCallBacks);CFDictionarySetValue(scope_nodes[n].props,CFSTR("DeviceUsagePairs"),a);CFRelease(a);}
++    if(g_str_has_prefix(mode,"bad-pairs-"))CFDictionarySetValue(scope_nodes[n].props,CFSTR("DeviceUsagePairs"),CFSTR("vendor"));
++    if(g_str_has_prefix(mode,"owner-"))scope_node("IOHIDLibUserClient",n);
++    if(g_str_has_prefix(mode,"qemu-owner-"))scope_node("qemu-system-aarch64",n);
++    if(g_str_has_prefix(mode,"event-"))scope_node("IOHIDEventService",n);
++    if(g_str_has_prefix(mode,"unreadable-"))scope_nodes[n].unreadable=true;
++    if(!strcmp(mode,"specialized-hid"))scope_nodes[1].cls="AppleMultitouchHIDEventDriver";
++    if(!strcmp(mode,"name-is-not-class"))scope_nodes[1].cls="AppleUserUSBHostHIDDevice";
++    if(!strcmp(mode,"specialized-leaf"))scope_nodes[4].cls="AppleGameControllerHIDInterface";
++    if(!strcmp(mode,"unknown-root-driver"))scope_node("AppleInternalDeviceDriver",2);
++    if(!strcmp(mode,"second-hid"))scope_node("IOHIDDevice",3);
++    if(!strcmp(mode,"second-interface"))shim_interfaces=2;
++    if(!strcmp(mode,"boot-interface"))shim_protocol=1;
++    if(!strcmp(mode,"invalid-iterator"))scope_invalid=true;
++    if(!strcmp(mode,"class-failure"))scope_class_fail=true;
++    if(!strcmp(mode,"parent-failure"))scope_parent_fail=true;
++    if(!strcmp(mode,"wrong-generation"))review_registry_delta=1;
++    if(!strcmp(mode,"missing-generation"))review_no_service=1;
++    if(!strcmp(mode,"primary-pair-mismatch"))scope_num(1,CFSTR("PrimaryUsage"),2);
++    if(!strcmp(mode,"security-page"))scope_num(1,CFSTR("PrimaryUsagePage"),0xf1d0);
++    if(!strcmp(mode,"digitizer-page"))scope_num(1,CFSTR("PrimaryUsagePage"),0x0d);
++    USBDevice *d=USB_DEVICE(qdev_new("usb-host-hid"));
++    qdev_prop_set_uint64(&d->qdev,"registry-id",123);qdev_prop_set_uint16(&d->qdev,"vendorid",0xc251);qdev_prop_set_uint16(&d->qdev,"productid",0x1701);qdev_prop_set_string(&d->qdev,"serial","tFIXTUR0E123");
++    Error *err=NULL;bool ok=native_open(HOST_HID(d),&err);
++    printf("%s %s expected=%d actual=%d create=%u open=%d registry_reads=%u precreate_reads=%u error=%s\n",ok==allow?"PASS":"FAIL",mode,allow,ok,scope_created,review_open_attempts,scope_reads,scope_create_reads,err?error_get_pretty(err):"none");
++    bool pass=ok==allow && (allow?(scope_created==1 && review_open_attempts==1 && scope_create_reads==scope_reads):(scope_created==0 && review_open_attempts==0));
++    if(ok)native_close(HOST_HID(d));g_clear_pointer(&HOST_HID(d)->product,g_free);if(err)error_free(err);object_unref(d);
++    return pass?0:1;
++}
+--- /dev/null
++++ b/tests/unit/no-native.c
+@@ -0,0 +1,13 @@
++/* Reviewer safety fence for inherited QEMU block_file-posix disk discovery.
++ * Diskless tests must not call these. Production HID calls are separately
++ * replaced by review-native-shim.h before compiling the complete source. */
++#include <IOKit/IOKitLib.h>
++#include <stdlib.h>
++#include <stdio.h>
++static void forbidden(void) __attribute__((noreturn));
++static void forbidden(void) { fputs("FORBIDDEN native block IORegistry call\n", stderr); abort(); }
++io_object_t IOIteratorNext(io_iterator_t iterator) { forbidden(); }
++kern_return_t IOObjectRelease(io_object_t object) { forbidden(); }
++CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t e, CFStringRef k, CFAllocatorRef a, IOOptionBits o) { forbidden(); }
++kern_return_t IOServiceGetMatchingServices(mach_port_t p, CFDictionaryRef d, io_iterator_t *i) { forbidden(); }
++CFMutableDictionaryRef IOServiceMatching(const char *n) { forbidden(); }

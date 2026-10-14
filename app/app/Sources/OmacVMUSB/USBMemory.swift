@@ -25,6 +25,8 @@ public struct USBMemory: Equatable, Sendable {
         public var product: String
         /// "" for a device without one: then it matches any device of that id.
         public var serial: String
+        /// Exact identity only for the optional HID transport; old serial stays vanilla.
+        public var hidSerial: String? = nil
         public var name: String
         public var maker: String
         public var choice: USBPlan
@@ -45,7 +47,14 @@ public struct USBMemory: Equatable, Sendable {
         public var id: USBDeviceID? { USBDeviceID(text: "\(vendor):\(product)") }
 
         /// Unique within the list: the id and the serial.
-        public var key: String { "\(vendor):\(product)/\(serial)" }
+        var hidKey: String? { hidSerial.map(USBHID.serialKey) }
+        public var key: String { hidKey.map { "hid:\(vendor):\(product)/\($0)" } ?? "\(vendor):\(product)/\(serial)" }
+
+        public static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.vendor == rhs.vendor && lhs.product == rhs.product && lhs.serial == rhs.serial
+                && lhs.hidKey == rhs.hidKey && lhs.name == rhs.name && lhs.maker == rhs.maker
+                && lhs.choice == rhs.choice && lhs.since == rhs.since
+        }
 
         public var displayName: String { name.isEmpty ? "USB device" : name }
     }
@@ -59,7 +68,10 @@ public struct USBMemory: Equatable, Sendable {
     /// their own choice, a device without a serial has one for all of them).
     public func entry(for d: USBDevice) -> Device? {
         let v = String(format: "%04x", d.id.vendor), p = String(format: "%04x", d.id.product)
-        let same = devices.filter { $0.vendor == v && $0.product == p }
+        let matching = devices.filter { $0.vendor == v && $0.product == p }
+        // Never lend an ordinary key to the HID picker/Forget or inherit its routing.
+        if let hid = d.hid { return matching.first { $0.hidKey == hid.serialKey } }
+        let same = matching.filter { $0.hidSerial == nil }
         if !d.serial.isEmpty, let e = same.first(where: { $0.serial == d.serial }) { return e }
         return same.first { $0.serial.isEmpty }
     }
@@ -72,6 +84,7 @@ public struct USBMemory: Equatable, Sendable {
         let name = USBChoice.clean(d.name), maker = USBChoice.clean(d.maker)
         if let e = entry(for: d), let i = devices.firstIndex(of: e) {
             devices[i].choice = choice
+            devices[i].hidSerial = d.hid?.serial
             if !name.isEmpty { devices[i].name = name }
             if !maker.isEmpty { devices[i].maker = maker }
             return
@@ -79,6 +92,7 @@ public struct USBMemory: Equatable, Sendable {
         devices.insert(Device(vendor: String(format: "%04x", d.id.vendor), product: String(format: "%04x", d.id.product),
                               serial: USBChoice.clean(d.serial), name: name, maker: maker, choice: choice, since: today),
                        at: 0)
+        devices[0].hidSerial = d.hid?.serial
         if devices.count > Self.maxDevices { devices.removeLast(devices.count - Self.maxDevices) }
     }
 

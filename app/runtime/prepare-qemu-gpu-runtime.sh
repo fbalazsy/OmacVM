@@ -478,6 +478,7 @@ verify_runtime_tree() {
   device_help=$("$qemu" -device help 2>&1) || \
     die "relocated QEMU could not enumerate devices: $device_help"
   for device in \
+    'name "usb-host-hid"' \
     'name "virtio-gpu-gl-pci"' \
     'name "intel-hda"' \
     'name "hda-micro"' \

@@ -7,6 +7,26 @@ public protocol USBQMPTransport {
     func execute(_ command: String, _ arguments: [String: Any]?) throws -> [String: Any]
 }
 
+/// Only a well-formed error envelope with the matching command ID proves rejection.
+/// Transport failures (including malformed replies) must not use this type.
+public struct QMPCommandRejection: Error, LocalizedError, CustomStringConvertible, Sendable {
+    public let command: String
+    public let errorClass: String
+    public let detail: String
+    public init(command: String, errorClass: String, detail: String) {
+        self.command = command; self.errorClass = errorClass; self.detail = detail
+    }
+    public var description: String { "QMP command \(command) failed: \(detail)" }
+    public var errorDescription: String? { description }
+}
+
+/// Connection setup failed, or the connection was closed before sending this command.
+public struct QMPCommandNotSent: Error, LocalizedError, Sendable {
+    public let detail: String
+    public init(_ detail: String) { self.detail = detail }
+    public var errorDescription: String? { detail }
+}
+
 /// How the app gives a plugged-in device to the VM and takes it back, over
 /// QMP while QEMU runs. A device is named by where it is plugged in
 /// ("usbh-<locationID>"), and QEMU opens exactly that one: by its bus and
@@ -20,8 +40,13 @@ public enum USBQMP {
     public static func qemuID(location: UInt32) -> String { String(format: "usbh-%08x", location) }
 
     public static func attachArguments(_ d: USBDevice) -> [String: Any] {
-        ["driver": "usb-host", "id": qemuID(location: d.location), "bus": "\(controller).0",
-         "hostbus": d.bus, "hostaddr": d.address]
+        if let hid = d.hid {
+            return ["driver": "usb-host-hid", "id": qemuID(location: d.location), "bus": "\(controller).0",
+                    "registry-id": hid.registryID, "vendorid": d.id.vendor, "productid": d.id.product,
+                    "serial": hid.serial]
+        }
+        return ["driver": "usb-host", "id": qemuID(location: d.location), "bus": "\(controller).0",
+                "hostbus": d.bus, "hostaddr": d.address]
     }
 
     /// The ids "info usb" lists: a device QEMU has attached to the VM's bus
@@ -55,8 +80,12 @@ public enum USBQMP {
         let id = qemuID(location: d.location)
         do {
             _ = try qmp.execute("device_add", attachArguments(d))
+        } catch let rejection as QMPCommandRejection where d.hid != nil && rejection.command == "device_add" {
+            return reason(qemuError: rejection.detail)
+        } catch let notSent as QMPCommandNotSent where d.hid != nil {
+            return .failed(String(notSent.detail.prefix(160)))
         } catch {
-            return reason(qemuError: "\(error)")
+            return d.hid == nil ? reason(qemuError: "\(error)") : .releaseRequired(String("\(error)".prefix(160)))
         }
         var answered = false
         for i in 0..<10 {
@@ -66,7 +95,8 @@ public enum USBQMP {
                 if ids.contains(id) { return .attached }
             }
         }
-        _ = try? qmp.execute("device_del", ["id": id])
+        do { _ = try qmp.execute("device_del", ["id": id]) }
+        catch { if d.hid != nil { return .releaseRequired(String("\(error)".prefix(160))) } }
         // QEMU never answered "info usb": not a Mac app's doing.
         return answered ? .busy : .failed("QEMU did not answer")
     }
@@ -74,10 +104,11 @@ public enum USBQMP {
     /// Takes it from the VM (the Mac gets it back when QEMU closes it).
     /// True once "info usb" no longer lists it.
     @discardableResult
-    public static func detach(location: UInt32, over qmp: USBQMPTransport,
+    public static func detach(location: UInt32, over qmp: USBQMPTransport, confirmDelete: Bool = false,
                               wait: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }) -> Bool {
         let id = qemuID(location: location)
-        _ = try? qmp.execute("device_del", ["id": id])
+        do { _ = try qmp.execute("device_del", ["id": id]) }
+        catch { if confirmDelete { return false } }
         for i in 0..<7 {
             if i > 0 { wait(0.3) }
             if let ids = try? attached(over: qmp), !ids.contains(id) { return true }
@@ -99,6 +130,15 @@ public enum USBAttachResult: Equatable, Sendable {
     case gone
     /// The VM's controller has no free port.
     case full
-    /// QEMU did not answer, or said something else.
+    /// No instance was created, or its deletion was confirmed.
     case failed(String)
+    /// Add may have applied, or post-add deletion failed. Retry Disconnect, not Connect.
+    case releaseRequired(String)
+
+    var requiresRelease: Bool {
+        switch self {
+        case .attached, .releaseRequired: return true
+        default: return false
+        }
+    }
 }

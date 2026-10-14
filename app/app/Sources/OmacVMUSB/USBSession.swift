@@ -93,6 +93,8 @@ public final class USBSession {
         case asking
         case connecting
         case connected
+        case disconnecting
+        case releaseFailed
         /// Unplugged while the VM had it: waiting `grace` for it to come back.
         case leaving
         /// Stays with the Mac: remembered (or "this time").
@@ -106,6 +108,15 @@ public final class USBSession {
         public var how: String
         /// Came back at the same place while leaving.
         public var returned: USBDevice?
+        var hidPath: Bool { device.hid != nil || hidIdentity != nil }
+        var attachPending = false
+        var leavingReady = false
+        /// A question answer or Connect/Disconnect, not an automatic saved route.
+        var explicitDecision = false
+        /// Last reliable logical HID identity, retained through incomplete snapshots.
+        var hidIdentity: String?
+        /// Current Ask/Connect while metadata is unavailable, never the next-plug plan.
+        var suspendedPlan: USBPlan?
     }
 
     public let vmName: String
@@ -115,6 +126,23 @@ public final class USBSession {
     public private(set) var queue: [UInt32] = []
     public private(set) var asking: UInt32?
     public private(set) var stopped = false
+
+    private var present: [UInt32: USBDevice] = [:]
+
+    /// Physical inventory, plus only unresolved HID instances after removal.
+    public var rows: USBListRows {
+        var inventory = present
+        for p in plugs.values where p.hidPath {
+            if p.state == .disconnecting || p.state == .releaseFailed || p.state == .leaving {
+                inventory[p.device.location] = p.device
+            } else if var d = inventory[p.device.location], d.hid == nil, d.availability == .free {
+                d.hidUnavailable = "HID is still being set up"
+                inventory[d.location] = d
+            }
+        }
+        return USBListRows.make(memory: memory, devices: inventory.values.sorted { $0.location < $1.location },
+                               states: plugs.mapValues(\.state), vmName: vmName)
+    }
 
     /// The VM's window (or this app's question) is in front: only then is a
     /// question shown; until then devices wait.
@@ -147,7 +175,64 @@ public final class USBSession {
     /// A device appeared (or was there when the VM started).
     public func plugged(_ d: USBDevice) {
         guard !stopped else { return }
+        present[d.location] = d
         if var p = plugs[d.location] {
+            let firstHID = !p.hidPath && d.hid != nil
+            let hidRefresh = p.hidPath || d.hid != nil
+            let identity = Self.hidIdentity(d)
+            p.hidIdentity = p.hidIdentity ?? Self.hidIdentity(p.device)
+            let replacement = p.hidPath && Self.hidReplacement(p, d)
+            p.hidIdentity = p.hidIdentity ?? identity
+            plugs[d.location] = p
+            if case .onMac = p.state, hidRefresh, p.device != d {
+                if replacement || (firstHID && !p.explicitDecision) {
+                    // A different logical device gets its own plan; registry alone is not identity.
+                    plugs[d.location] = nil
+                    plugged(d)
+                    return
+                }
+                // Eligibility can change without a new physical plug. Keep this
+                // plug's decision; the list and Connect check fresh availability.
+                p.device = d
+                plugs[d.location] = p
+                changed()
+                return
+            }
+            if hidRefresh && p.device != d && (p.state == .asking || p.state == .waiting || p.suspendedPlan != nil) {
+                // Complete this target refresh even when a replacement auto-connects.
+                defer { askNext() }
+                if p.state == .asking { asker.cancel(); asking = nil }
+                queue.removeAll { $0 == d.location }
+                if firstHID || replacement {
+                    plugs[d.location] = nil
+                    plugged(d)
+                    return
+                }
+                let plan = p.suspendedPlan ?? .ask
+                p.device = d
+                if prepareHIDResume(&p, plan: plan) && plan == .ask { queue.append(d.location) }
+                plugs[d.location] = p
+                if p.state == .waiting && plan == .omarchy { connect(d.location, how: p.how) }
+                changed()
+                return
+            }
+            if hidRefresh && (p.device.hid != d.hid || p.device.availability != d.availability)
+                && (p.state == .connected || p.state == .connecting) {
+                unplugged(location: d.location)
+                plugged(d)
+                return
+            }
+            if p.state == .disconnecting || p.state == .releaseFailed || (p.hidPath && p.state == .leaving) {
+                p.returned = d
+                plugs[d.location] = p
+                return
+            }
+            if case .kept = p.state, hidRefresh, d.hid != nil, p.device != d {
+                // IOHIDDevice may publish after its IOUSBHostDevice parent.
+                plugs[d.location] = nil
+                plugged(d)
+                return
+            }
             // The same device back (same id and serial, still free): a reset.
             if p.state == .leaving && p.device.id == d.id && p.device.serial == d.serial && d.availability == .free {
                 p.returned = d
@@ -190,6 +275,7 @@ public final class USBSession {
     /// A device went away.
     public func unplugged(location: UInt32) {
         guard !stopped, let p = plugs[location] else { return }
+        present[location] = nil
         switch p.state {
         case .asking:
             asker.cancel()
@@ -208,7 +294,7 @@ public final class USBSession {
             let wasConnecting = p.state == .connecting
             clock.after(Self.grace) { [weak self] in
                 guard let self, !self.stopped, self.plugs[location]?.state == .leaving else { return }
-                if wasConnecting {
+                if wasConnecting || self.plugs[location]?.hidPath == true {
                     self.finishLeaving(location, attached: false)
                     return
                 }
@@ -216,6 +302,10 @@ public final class USBSession {
                     self?.finishLeaving(location, attached: attached)
                 }
             }
+        case .disconnecting, .releaseFailed:
+            var q = p
+            q.returned = nil
+            plugs[location] = q
         case .leaving:
             // Back and gone again within the grace time: gone (unless it comes back once more).
             var q = p
@@ -232,6 +322,16 @@ public final class USBSession {
     /// VM lost is given to it again (the user gave it for this plug-in).
     private func finishLeaving(_ location: UInt32, attached: Bool) {
         guard var p = plugs[location], p.state == .leaving else { return }
+        if p.hidPath {
+            // Wait for the result before deciding whether the target owns cleanup.
+            if p.attachPending {
+                p.leavingReady = true
+                plugs[location] = p
+                return
+            }
+            releaseHID(location, returned: p.returned, reconnect: true)
+            return
+        }
         if let back = p.returned {
             p.device = back
             p.returned = nil
@@ -265,6 +365,7 @@ public final class USBSession {
         asking = nil
         queue.removeAll()
         plugs.removeAll()
+        present.removeAll()
         changed()
     }
 
@@ -292,6 +393,7 @@ public final class USBSession {
             return
         }
         let how = a.always ? "asked, always" : "asked, this time"
+        p.explicitDecision = true
         if a.always {
             memory.remember(p.device, a.connect ? .omarchy : .mac)
             save(memory)
@@ -318,6 +420,7 @@ public final class USBSession {
 
     private func connect(_ loc: UInt32, how: String) {
         guard var p = plugs[loc] else { return }
+        guard !p.hidPath || (p.device.hid != nil && p.device.availability == .free) else { return }
         if connectedCount >= Self.maxConnected {
             p.state = .onMac(remembered: false)
             p.how = how
@@ -329,6 +432,7 @@ public final class USBSession {
             return
         }
         p.state = .connecting
+        p.attachPending = p.hidPath
         p.how = how
         plugs[loc] = p
         changed()
@@ -347,9 +451,21 @@ public final class USBSession {
             if result == .attached && plugs[loc] == nil { machine.detach(d) { _ in } }
             return
         }
+        p.attachPending = false
+        plugs[loc] = p
         if p.state == .leaving {
+            if !p.hidPath {
+                if result != .attached { machine.detach(d) { _ in } }
+                return
+            }
+            if !result.requiresRelease {
+                plugs[loc] = nil
+                if let back = p.returned { plugged(back) }
+                changed()
+                return
+            }
             // Unplugged while QEMU took it: the grace time decides.
-            if result != .attached { machine.detach(d) { _ in } }
+            if p.leavingReady { finishLeaving(loc, attached: false) }
             return
         }
         switch result {
@@ -357,12 +473,19 @@ public final class USBSession {
             p.state = .connected
             plugs[loc] = p
             log("OmacVM: USB: \(Self.label(d)) connected (\(p.how))")
+            if d.hid != nil { watchHID(d) }
+        case .releaseRequired:
+            p.state = .releaseFailed
+            p.returned = d
+            plugs[loc] = p
+            log("OmacVM: USB: \(Self.label(d)) needs release: \(Self.why(result))")
+            asker.notice(title: "Couldn’t confirm “\(d.displayName)”", text: Self.noticeText(result, vmName: vmName, hid: p.hidPath))
         case .busy, .gone, .full, .failed:
             p.state = .onMac(remembered: false)
             plugs[loc] = p
             log("OmacVM: USB: \(Self.label(d)) not connected: \(Self.why(result))")
             if result != .gone {
-                asker.notice(title: "Couldn’t connect “\(d.displayName)”", text: Self.noticeText(result, vmName: vmName))
+                asker.notice(title: "Couldn’t connect “\(d.displayName)”", text: Self.noticeText(result, vmName: vmName, hid: p.hidPath))
             }
         }
         changed()
@@ -370,9 +493,11 @@ public final class USBSession {
 
     /// Gives a plugged-in device to the VM now (the list's Connect).
     public func connectNow(location: UInt32) {
-        guard !stopped, let p = plugs[location] else { return }
+        guard !stopped, var p = plugs[location] else { return }
         switch p.state {
         case .onMac, .waiting:
+            p.explicitDecision = true
+            plugs[location] = p
             queue.removeAll { $0 == location }
             connect(location, how: "from the list")
         default:
@@ -382,13 +507,101 @@ public final class USBSession {
 
     /// Gives it back to the Mac now (the list's Disconnect).
     public func disconnectNow(location: UInt32) {
-        guard !stopped, var p = plugs[location], p.state == .connected else { return }
+        guard !stopped, var p = plugs[location], p.state == .connected || p.state == .releaseFailed else { return }
+        p.explicitDecision = true
+        plugs[location] = p
+        if p.device.hid != nil || p.state == .releaseFailed {
+            releaseHID(location, returned: p.state == .connected ? p.device : p.returned, reconnect: false)
+            return
+        }
         p.state = .onMac(remembered: false)
         p.how = "from the list"
         plugs[location] = p
         machine.detach(p.device) { _ in }
         log("OmacVM: USB: \(Self.label(p.device)) disconnected (from the list)")
         changed()
+    }
+
+    /// IOHID loss/overflow detaches irreversibly; do not leave a stale Connected
+    /// row or silently reopen it. The existing list offers an explicit retry.
+    private func watchHID(_ d: USBDevice) {
+        clock.after(1) { [weak self] in
+            guard let self, !self.stopped, self.plugs[d.location]?.device == d,
+                  self.plugs[d.location]?.state == .connected else { return }
+            self.machine.isAttached(d) { [weak self] attached in
+                guard let self, !self.stopped, self.plugs[d.location]?.device == d,
+                      self.plugs[d.location]?.state == .connected else { return }
+                if attached { self.watchHID(d) } else {
+                    self.releaseHID(d.location, returned: d, reconnect: false)
+                    self.asker.notice(title: "“\(d.displayName)” disconnected", text: "QEMU lost the HID connection. Connect again to retry.")
+                }
+            }
+        }
+    }
+
+    /// Suspend only the current decision until its HID snapshot is ready.
+    private func prepareHIDResume(_ p: inout Plug, plan: USBPlan) -> Bool {
+        let ready = p.device.hid != nil && p.device.availability == .free
+        p.suspendedPlan = ready ? nil : plan
+        if ready { p.state = .waiting }
+        else if case .usedByMac(let why) = p.device.availability { p.state = .kept(why) }
+        else { p.state = .kept("HID is still being set up") }
+        return ready
+    }
+
+    /// Retain the old generation until device_del completes. A replacement can
+    /// come and go meanwhile; only the latest still-present one may reconnect.
+    private func releaseHID(_ loc: UInt32, returned: USBDevice?, reconnect: Bool) {
+        guard var p = plugs[loc] else { return }
+        let old = p.device
+        p.state = .disconnecting
+        p.returned = returned
+        plugs[loc] = p
+        changed()
+        machine.detach(old) { [weak self] released in
+            guard let self, !self.stopped, var current = self.plugs[loc],
+                  current.device == old, current.state == .disconnecting else { return }
+            guard released else {
+                current.state = .releaseFailed
+                self.plugs[loc] = current
+                self.changed()
+                return
+            }
+            self.plugs[loc] = nil
+            if let back = current.returned {
+                let identity = current.hidIdentity ?? Self.hidIdentity(old)
+                let same = identity != nil ? !Self.hidReplacement(current, back)
+                    : (back.id == old.id && back.serial == old.serial)
+                if same {
+                    // Deletion releases the generation, not this logical device's decision.
+                    current.device = back
+                    current.returned = nil
+                    current.hidIdentity = identity ?? Self.hidIdentity(back)
+                    current.leavingReady = false
+                    current.state = .onMac(remembered: false)
+                    let ready = reconnect && self.prepareHIDResume(&current, plan: .omarchy)
+                    self.plugs[loc] = current
+                    if ready { self.connect(loc, how: current.how) }
+                } else {
+                    self.plugged(back)
+                }
+            }
+            self.changed()
+        }
+    }
+
+    /// Missing HID metadata is not replacement evidence; a different ID or a
+    /// published, non-HID interface is. Only an existing HID decision uses this.
+    private static func hidReplacement(_ p: Plug, _ d: USBDevice) -> Bool {
+        if d.id != p.device.id { return true }
+        if let identity = hidIdentity(d) { return identity != (p.hidIdentity ?? hidIdentity(p.device)) }
+        return d.hidUnavailable == nil && !d.interfaces.isEmpty && d.interfaces.allSatisfy {
+            (1...255).contains($0.interfaceClass) && $0.interfaceClass != 3
+        }
+    }
+
+    private static func hidIdentity(_ d: USBDevice) -> String? {
+        d.hid.map { "\(d.id)/\($0.serialKey)" }
     }
 
     // MARK: The remembered list (changes only later plug-ins)
@@ -425,14 +638,16 @@ public final class USBSession {
         case .busy: return "in use on the Mac"
         case .gone: return "unplugged"
         case .full: return "the VM's USB controller is full"
-        case .failed(let e): return "QEMU: \(USBChoice.clean(e))"
+        case .failed(let e), .releaseRequired(let e): return "QEMU: \(USBChoice.clean(e))"
         }
     }
 
-    public static func noticeText(_ r: USBAttachResult, vmName: String) -> String {
+    public static func noticeText(_ r: USBAttachResult, vmName: String, hid: Bool = false) -> String {
         switch r {
         case .busy: return "A Mac app is using it. Quit that app, then unplug the device and plug it in again."
         case .full: return "\(vmName) already has \(maxConnected) USB devices. Unplug one first."
+        case .failed(let detail) where hid: return "\(vmName) didn’t take it: \(USBChoice.clean(detail))"
+        case .releaseRequired(let detail): return "QEMU may still have it. Retry Disconnect before connecting again, or stop the VM. \(USBChoice.clean(detail))"
         default: return "\(vmName) didn’t take it. Unplug it and plug it in again to try once more."
         }
     }

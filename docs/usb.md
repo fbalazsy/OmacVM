@@ -1,8 +1,8 @@
 # USB devices in OmacVM.app (experimental, off by default)
 
-A VM can have a USB device of the Mac, but only one that macOS doesn't use
-itself. That is a macOS rule, not an OmacVM one. This page says how it works,
-which devices work and which don't, and why.
+A VM can have an unused USB device of the Mac. Supported vendor HID devices
+can also use a rootless report-level path. Other devices held by macOS stay
+with the Mac. This page says how it works and which devices are supported.
 
 ## Turn it on
 
@@ -54,11 +54,64 @@ without a serial number has one entry for all of them.
 - If a Mac app has the device open, it stays on the Mac and OmacVM says so.
   Quit the app, then unplug the device and plug it in again.
 
+## Vendor HID (requires a runtime with `usb-host-hid`)
+
+Eligible niche ECU/development-board vendor HID devices appear in the same
+**Devices…** list, including before a VM starts. From first use, the existing
+Ask / Mac / Omarchy choices, Always, Forget and current Connect / Disconnect
+apply as the ordinary user. There is no enrollment, helper installation,
+administrator password, extra permission consent, device profile or new panel.
+Choose **Connect to Omarchy** in that list to remember automatic connection
+at future VM starts and replug. The existing UI wording is unchanged.
+A stock runtime without this driver reports a connection failure; the app does
+not fall back to `usb-host` or privileged capture.
+
+The read-only scan requires one complete non-boot HID interface and one generic
+`IOHIDDevice` or `AppleUserHIDDevice` service, optionally with leaf
+`IOHIDInterface` children. The bounded descriptor has one vendor-page application,
+at most 1024 bytes, reports of at most 64 wire bytes, and a nonempty raw serial
+(at most 126 UTF-16 units). Positive PrimaryUsagePage/PrimaryUsage and
+DeviceUsagePairs metadata must agree with that application. Built-In indicators,
+non-vendor/malformed metadata, specialized services and existing owned children
+exclude the extension. A vendor page is not proof of a device's physical purpose.
+No product/serial allowlist or permission setting overrides those checks.
+
+Every non-target keeps its original availability, reason text, controls, routing,
+errors and reconnect behavior, including an unclaimed class-3 device or an
+incomplete deeper ordinary tree. Rejection only withholds the new HID extension;
+it does not introduce a blanket HID ban or repair ordinary USB behavior. HID
+publication notifications upgrade only a positively admitted target (or refresh
+a target already tracked this plug), not unrelated device events.
+
+QEMU receives the actual current **IOHIDDevice registry ID**, VID/PID and raw
+serial, never a parent USB ID, location or serial wildcard. It rechecks identity
+and eligibility before an ordinary-user, non-seizing IOHID open. Close other
+applications that use the same device: non-seizing access is not exclusive.
+The virtual USB descriptors are synthesized; this is not arbitrary raw USB
+passthrough, and it does not reset or seize the physical device.
+
+Physical loss irreversibly detaches that native instance. The app deletes it
+before adding a returned generation under the existing reconnect policy. A
+native failure without replug stops the connection and offers manual retry,
+not hidden reopening. A failed deletion keeps Connect disabled until release
+is confirmed (retry Disconnect, or stop the VM).
+
+`swift run usb-tests --offline` exercises synthetic registry trees, rejected
+shapes, raw identity, remembered startup selection, routing and lifecycle races
+without scanning or opening USB. `--offline` rejects `--list` and `--qmp`.
+The existing offscreen renderer includes vendor HID startup and lifecycle
+rows. These are source/offline gates, **not live guest or hardware acceptance**.
+Actual discovery timing, app signing/TCC, native runtime integration, guest
+reports and physical replug still require separate hardware testing.
+
 ## Files and logs
 
 - `usb-enabled` in the VM's folder is the switch (`on` or `off`). `usb.json`
   holds the remembered devices (yours only, 0600). An answer for one plug-in
-  is never written down.
+  is never written down. The existing version-1 format has one optional
+  target-only `hidSerial` field for the exact HID identity. Normal `serial`
+  cleaning, old records and ordinary matching are unchanged; `hidSerial` records
+  do not match ordinary devices. No separate store or schema migration is added.
 - From 3.0.1 to 3.0.3 a device switched on in the window went to the VM by
   itself. 3.0.4 keeps that: those devices become **Connect to Omarchy** in
   the list, the switch stays on, and the old `usb` file is renamed
@@ -113,14 +166,14 @@ Until then, other ways work for some of these:
 
 - With the switch off, QEMU gets no USB controller and never uses USB.
 - With it on, the VM gets an empty USB controller. QEMU opens a device only
-  when you connect it, and only that one: by its bus and address. It never
+  when you connect it, and only that one: by its bus/address, or exact HID registry generation. It never
   looks for other devices itself.
 - A device you connect belongs to the VM while it has it: Linux can do
   anything with it, firmware updates included. Connect only devices you
   would plug into that Linux machine.
 - The app reads macOS's device list to see what is plugged in; it opens no
   device itself.
-- Only a device nothing on the Mac uses can be connected.
+- Ordinary USB must be unused by the Mac; vendor HID uses the bounded report path above.
 - If macOS or a Mac app has a device, QEMU leaves it alone: no reset (on
   macOS a reset reconnects the device, which would pull a mounted disk)
   (patch `qemu-usb-host-busy-device.patch`).
