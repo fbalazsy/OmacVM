@@ -178,16 +178,31 @@ def focused_monitor() -> dict | None:
 def set_scale(value: str, wait: float = SCALE_WAIT) -> int:
     """A scale button of the display panel. In "Full screen including notch"
     on that output the Mac first gives the output a size the scale fits (the
-    agent passes it on), then Omarchy's own command sets and keeps it, so
-    every one of its scales takes; elsewhere Omarchy's command as it is."""
+    agent passes it on). Secondary outputs keep their own zoom; the main
+    output still uses Omarchy's command; named secondary rules are refused."""
     try:
         scale = float(value)
     except ValueError:
         scale = 0.0
-    if not 1 <= scale <= 4:
-        print("usage: omacvm-displays scale SCALE (1 to 4)", file=sys.stderr)
+    focused = focused_monitor() if scale >= 1 else None
+    name = focused.get("name", "") if focused else ""
+    secondary = bool(re.fullmatch(r"Virtual-[1-9][0-9]*", name)) and name != "Virtual-1"
+    # The panel labels effective scales; a 4x preset may round up past 4.
+    clean_secondary = (secondary and 4 < scale <= min(focused.get("width", 0), focused.get("height", 0))
+                       and scale_fits(focused["width"], focused["height"], scale))
+    if not (1 <= scale <= 4 or clean_secondary):
+        print("usage: omacvm-displays scale SCALE (1 to 4, or a clean external scale)", file=sys.stderr)
         return 2
-    out, focused = fullpanel_output(), focused_monitor()
+    if secondary:
+        try:
+            config = re.sub(r"--[^\n]*", "", MONITORS_LUA.read_text())
+        except OSError:
+            config = ""
+        if re.search(r"output\s*=\s*[\"']" + re.escape(name) + r"[\"']", config):
+            print(f"Refusing scale for {name}: edit its named monitor rule in {MONITORS_LUA}, "
+                  "or remove that rule to use automatic sizing and independent zoom.", file=sys.stderr)
+            return 2
+    out = fullpanel_output()
     if out and focused and focused.get("name") == out:
         poke(message=f"scale {scale:g}\n".encode())
         end = time.monotonic() + wait
@@ -198,6 +213,17 @@ def set_scale(value: str, wait: float = SCALE_WAIT) -> int:
             time.sleep(0.1)
         else:
             log(f"scale {scale:g}: the Mac gave {out} no size that fits it (older OmacVM.app?): Omarchy's nearest")
+    if secondary:
+        # Omarchy persists a global scale even when it changed an external
+        # output. Keep that choice separately: no fixed mode, no change to
+        # the main display or the other outputs' density defaults.
+        import tempfile
+        folder = CONFIG.parent / "scales"
+        folder.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=folder, delete=False) as f:
+            f.write(f"{scale:g}\n")
+        Path(f.name).replace(folder / name)
+        return subprocess.call([SYNC, "--once"])
     return subprocess.call(["omarchy-hyprland-monitor-scaling", value])
 
 

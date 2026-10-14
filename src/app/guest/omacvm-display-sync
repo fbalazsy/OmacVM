@@ -13,10 +13,11 @@ monitor_config=${OMARCHY_DISPLAY_SYNC_MONITOR_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.
 layout_file=${OMACVM_DISPLAYS_LAYOUT:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omacvm/displays.json}
 state_dir=${OMACVM_DISPLAY_SYNC_STATE:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omacvm/display-sync}
 
-# preferred_mode_from_edid EDID [main|other]: Omarchy's scale setting is for
-# the main output; the other displays keep their own density.
+# preferred_mode_from_edid EDID OUTPUT: explicit zoom per output, otherwise
+# the main output's legacy Omarchy setting or each display's EDID density.
 preferred_mode_from_edid() {
-  python3 - "$1" "$monitor_config" "${2:-main}" <<'PY'
+  python3 - "$1" "$monitor_config" "$2" <<'PY'
+import os
 import pathlib
 import re
 import sys
@@ -87,8 +88,15 @@ def scale_for_mode(
     # Auto/missing settings retain the live EDID's density-based scale.
     requested = None
     try:
-        if sys.argv[3] != "main":
-            raise OSError("not the main output")
+        folder = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", pathlib.Path.home() / ".config"))
+        saved_scale = float((folder / "omacvm/scales" / sys.argv[3]).read_text())
+        if isfinite(saved_scale) and saved_scale >= 0.25:
+            requested = saved_scale
+    except (OSError, ValueError):
+        pass
+    try:
+        if requested is not None or sys.argv[3] != "Virtual-1":
+            raise OSError("no legacy scale needed")
         config = pathlib.Path(sys.argv[2]).read_text()
         match = re.search(
             r"^\s*local\s+omarchy_monitor_scale\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:--[^\n]*)?$",
@@ -606,8 +614,7 @@ apply_preferred_modes() {
 
     connector_name=${connector##*/}
     output=${connector_name#*-}
-    if ! preferred=$(preferred_mode_from_edid "$connector/edid" \
-        "$([[ $output == Virtual-1 ]] && echo main || echo other)"); then
+    if ! preferred=$(preferred_mode_from_edid "$connector/edid" "$output"); then
       continue
     fi
     IFS=$'\t' read -r mode scale <<<"$preferred"

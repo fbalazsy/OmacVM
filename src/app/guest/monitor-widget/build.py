@@ -64,10 +64,14 @@ FUNCS = """
     }
   }
 
-  // ---- OmacVM.app: every scale in "Full screen including notch" (#355) ----
-  function macFullPanelFocused() {
-    for (var i = 0; i < displays.length; i++)
-      if (displays[i] && displays[i].focused) return root.macFullPanel !== "" && displays[i].name === root.macFullPanel
+  // ---- OmacVM.app: independent secondary zoom and full-panel sizing ----
+  function macScaleManagedFocused() {
+    for (var i = 0; i < displays.length; i++) {
+      var display = displays[i]
+      if (display && display.focused)
+        return (root.macFullPanel !== "" && display.name === root.macFullPanel)
+          || (display.name !== "Virtual-1" && /^Virtual-[1-9][0-9]*$/.test(display.name))
+    }
     return false
   }
 
@@ -213,6 +217,10 @@ COMMONS_ALIAS = "import qs.Commons as Commons\n"
 
 # (anchor, replacement): every anchor must be found exactly once.
 EDITS = [
+    # Keep normal primary/non-VM scaling under Omarchy's original policy.
+    ('    actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]\n',
+     '    actionProc.command = root.macScaleManagedFocused() ? ["/usr/local/bin/omacvm-displays", "scale", String(scale)]\n'
+     '      : ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]\n'),
     ("  property int enabledDisplayCount: 0\n",
      "  property int enabledDisplayCount: 0\n" + PROPS),
     ('    if (displays.length > 1) list.push("monitors")\n',
@@ -250,9 +258,6 @@ OPTIONAL_EDITS = [
     ("        return Model.availableScales(scalePresets, display.width, display.height)\n",
      "        return root.macFullPanel !== \"\" && display.name === root.macFullPanel ? scalePresets\n"
      "          : Model.availableScales(scalePresets, display.width, display.height)\n"),
-    ('    actionProc.command = ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]\n',
-     '    actionProc.command = root.macFullPanelFocused() ? ["omacvm-displays", "scale", String(scale)]\n'
-     '      : ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]\n'),
     # The buttons' labels: the preset itself there, not the scale the current
     # size would round it to (at 1.67 on 2940x1915 that read 1x 1.25x 1.67x
     # 2.5x 5x 5x): the Mac gives each preset a size that fits it.

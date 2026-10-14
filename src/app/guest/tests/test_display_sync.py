@@ -202,6 +202,58 @@ class SyncCase(unittest.TestCase):
 
 
 class ModeAndScale(SyncCase):
+    def test_secondary_scale_survives_reload_resize_and_replug(self):
+        self.set_window(1920, 2160)
+        self.set_window(1920, 2160, "Virtual-2")
+        self.set_scale("1.6")
+        scales = self.tmp / "config/omacvm/scales"
+        scales.mkdir(parents=True)
+        (scales / "Virtual-2").write_text("1.25\n")
+        r = self.run_sync()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.shown("Virtual-2")["scale"], 1.25)
+        self.assertEqual(self.shown()["scale"], 1.6)
+        self.hyprland_reloads(1920, 1080)
+        self.set_window(2560, 1440, "Virtual-2")
+        self.run_sync()
+        self.assertEqual(self.shown("Virtual-2")["scale"], 1.25)
+        self.assertEqual(self.shown("Virtual-2")["width"], 2560)
+        (self.drm / "card0-Virtual-2/status").write_text("disconnected\n")
+        (self.hypr / "monitors.json").write_text(json.dumps([self.shown()]))
+        self.run_sync()
+        self.set_window(1920, 2160, "Virtual-2")
+        self.run_sync()
+        self.assertEqual(self.shown("Virtual-2")["scale"], 1.25)
+
+    def test_panel_command_reaches_dynamic_sync(self):
+        from test_omacvm_displays import od
+        from unittest import mock
+        self.set_window(1920, 2160)
+        self.set_window(1920, 2160, "Virtual-2")
+        self.set_scale("1.6")
+        self.run_sync()
+        original = self.config.read_text()
+        with mock.patch.object(od, "CONFIG", self.tmp / "config/omacvm/displays.conf"), \
+             mock.patch.object(od, "MONITORS_LUA", self.config), \
+             mock.patch.object(od, "fullpanel_output", return_value=None), \
+             mock.patch.object(od, "focused_monitor", return_value=self.shown("Virtual-2")), \
+             mock.patch.object(od.subprocess, "call", side_effect=lambda argv: self.run_sync().returncode) as call:
+            self.assertEqual(od.set_scale("1.25"), 0)
+            call.assert_called_once_with([od.SYNC, "--once"])
+        self.assertEqual(self.shown("Virtual-2")["scale"], 1.25)
+        self.assertEqual(self.shown()["scale"], 1.6)
+        self.assertEqual(self.config.read_text(), original)
+
+    def test_bad_secondary_preferences_keep_edid_density(self):
+        self.set_window(1920, 2160, "Virtual-2")
+        scales = self.tmp / "config/omacvm/scales"
+        scales.mkdir(parents=True)
+        for value in ("nan", "inf", "0", "-1", "broken"):
+            (scales / "Virtual-2").write_text(value)
+            r = self.run_sync()
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.shown("Virtual-2")["scale"], 2)
+
     def test_omarchy_scales_at_4k_and_5k(self):
         for width, height in ((5120, 2880), (3840, 2160)):
             for requested in ("1", "1.25", "1.5", "1.6", "1.75", "2"):

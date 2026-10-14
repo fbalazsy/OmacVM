@@ -559,7 +559,7 @@ class Scale(unittest.TestCase):
         self.lua = self.tmp / "monitors.lua"
         self.env = self.tmp / "host.env"
         self.builtin = self.tmp / "builtin"
-        for target, value in [("MONITORS_LUA", self.lua), ("HOST_ENV", self.env), ("BUILTIN", self.builtin)]:
+        for target, value in [("CONFIG", self.tmp / "displays.conf"), ("MONITORS_LUA", self.lua), ("HOST_ENV", self.env), ("BUILTIN", self.builtin)]:
             patcher = mock.patch.object(od, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -666,6 +666,56 @@ class Scale(unittest.TestCase):
         # An OmacVM.app without #355 never changes the size: Omarchy's nearest after the wait.
         rc, pokes, calls = self.set_scale([(2940, 1912)])
         self.assertEqual(calls, [["omarchy-hyprland-monitor-scaling", "1.6"]])
+
+    def test_secondary_choice_is_saved_without_changing_global_scale(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            config = pathlib.Path(d) / "displays.conf"
+            self.lua.write_text("local omarchy_monitor_scale = 1.6\n")
+            with mock.patch.object(od, "CONFIG", config):
+                rc, pokes, calls = self.set_scale([(1920, 2160)], fullpanel=False,
+                                                 focused="Virtual-2", value="1.25")
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls, [[od.SYNC, "--once"]])
+            self.assertEqual((config.parent / "scales/Virtual-2").read_text(), "1.25\n")
+            self.assertEqual(self.lua.read_text(), "local omarchy_monitor_scale = 1.6\n")
+            self.assertEqual(pokes, [])
+
+    def test_secondary_clean_scale_above_last_preset(self):
+        # Omarchy's panel can round its 4x preset up to a clean 5x.
+        rc, _, calls = self.set_scale([(2940, 1915)], fullpanel=False,
+                                      focused="Virtual-2", value="5")
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [[od.SYNC, "--once"]])
+
+    def test_secondary_named_rule_refuses_without_side_effects(self):
+        original = 'local omarchy_monitor_scale = 1.6\nhl.monitor({ output = "Virtual-2", scale = 2 })\n'
+        self.lua.write_text(original)
+        folder = od.CONFIG.parent / "scales"
+        folder.mkdir()
+        saved = folder / "Virtual-2"
+        saved.write_text("2\n")
+        # Even a full-panel output must refuse before asking the Mac to resize.
+        with mock.patch.object(od, "focused_monitor", return_value={
+                "name": "Virtual-2", "width": 1920, "height": 2160}), \
+             mock.patch.object(od, "fullpanel_output", return_value="Virtual-2"), \
+             mock.patch.object(od, "poke") as poke, \
+             mock.patch.object(od.subprocess, "call") as call, \
+             mock.patch("sys.stderr", new_callable=__import__("io").StringIO) as err:
+            self.assertEqual(od.set_scale("1.25"), 2)
+        call.assert_not_called()
+        poke.assert_not_called()
+        self.assertEqual(self.lua.read_text(), original)
+        self.assertEqual(saved.read_text(), "2\n")
+        self.assertIn("Virtual-2", err.getvalue())
+        self.assertIn(str(self.lua), err.getvalue())
+        self.assertIn("edit", err.getvalue().lower())
+
+    def test_secondary_choices_are_independent(self):
+        for output, value in (("Virtual-2", "1.25"), ("Virtual-3", "1.6"), ("Virtual-2", "2")):
+            self.set_scale([(1920, 2160)], fullpanel=False, focused=output, value=value)
+        self.assertEqual((od.CONFIG.parent / "scales/Virtual-2").read_text(), "2\n")
+        self.assertEqual((od.CONFIG.parent / "scales/Virtual-3").read_text(), "1.6\n")
 
     def test_scale_usage(self):
         with mock.patch("sys.stderr"):

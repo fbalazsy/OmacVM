@@ -59,7 +59,10 @@ class Build(unittest.TestCase):
         self.assertEqual(self.build(), 0)
         text = (self.out / "Panel.qml").read_text()
         self.assertIn('display.name === root.macFullPanel ? scalePresets', text)
-        self.assertIn('root.macFullPanelFocused() ? ["omacvm-displays", "scale", String(scale)]', text)
+        self.assertIn('root.macScaleManagedFocused() ? ["/usr/local/bin/omacvm-displays", "scale", String(scale)]', text)
+        self.assertIn(': ["bash", "-c", "omarchy-hyprland-monitor-scaling " + scale]', text)
+        self.assertIn('display.name !== "Virtual-1" && /^Virtual-[1-9][0-9]*$/.test(display.name)', text)
+        self.assertIn('display.name === root.macFullPanel', text)
         self.assertIn('command: ["omacvm-displays", "fullpanel"]', text)
         self.assertIn("if (!macFullPanelProc.running) macFullPanelProc.running = true", text)
         # The labels are the presets (1x 1.25x 1.6x 2x 3x 4x), not what the current size rounds them to.

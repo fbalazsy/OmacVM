@@ -825,6 +825,22 @@ window per guest screen:
   window code to `omacvm-displays` in the VM (a user service), which writes
   it for `omacvm-display-sync`; that places each output as the Mac's
   displays are. A display with its own rule in `monitors.lua` keeps it.
+- The display panel keeps zoom separately for each secondary output in
+  `~/.config/omacvm/scales/Virtual-N` (`$XDG_CONFIG_HOME` when set). Its
+  buttons call `omacvm-displays scale SCALE` for secondary and full-panel
+  outputs; normal primary scaling keeps Omarchy's original command. The
+  wrapper also works from a terminal on the focused output. A secondary
+  output with a named rule in `monitors.lua` is refused without changes:
+  edit that rule, or remove it to use automatic sizing and independent zoom.
+  The main output still uses Omarchy's
+  `omarchy_monitor_scale`. Other outputs keep their EDID density until a
+  scale is chosen for them. A choice survives reloads, window resizing and
+  reconnecting the output, without pinning its resolution or refresh rate.
+  Remove that output's scale file and run `omacvm-display-sync --once` to
+  return to its automatic density. Choices belong to virtual outputs, not
+  physical monitor serial numbers. Omarchy's original scaling command still
+  has its global persistence semantics; use the panel or OmacVM's command
+  for independent secondary zoom.
 - QEMU opens the other windows only after `omacvm-displays` said hello on
   that port (a VM without it keeps one screen) and while the switch is on.
   It applies the VM's switch at most once a second, and it takes only
