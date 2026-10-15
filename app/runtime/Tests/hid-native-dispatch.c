@@ -16,7 +16,7 @@
 #define USB_RET_ASYNC (-6)
 #define USB_RET_STALL (-3)
 typedef pthread_mutex_t QemuMutex;
-typedef int QEMUBH;
+typedef struct { void (*callback)(void *); void *opaque; } QEMUBH;
 typedef int USBDevice;
 typedef int USBPacket;
 typedef int USBDesc;
@@ -29,7 +29,25 @@ typedef struct HostHIDState HostHIDState;
 #define qemu_mutex_lock pthread_mutex_lock
 #define qemu_mutex_unlock pthread_mutex_unlock
 static atomic_int bh_calls;
-static void qemu_bh_schedule(QEMUBH *bh) { assert(bh); atomic_fetch_add(&bh_calls,1); }
+static dispatch_semaphore_t close_ready;
+static unsigned refs=1, late_callbacks;
+static pthread_t main_thread;
+static bool teardown;
+#define HOST_HID(p) ((HostHIDState *)(p))
+#define OBJECT(p) (p)
+#define g_free free
+#define g_clear_pointer(p, fn) do { fn(*(p)); *(p)=NULL; } while (0)
+static void native_close(HostHIDState *s);
+static void object_ref(HostHIDState *s) { assert(pthread_equal(pthread_self(),main_thread)); refs++; }
+static void object_unref(HostHIDState *s) { assert(pthread_equal(pthread_self(),main_thread)); assert(refs==2); refs--; }
+static QEMUBH *qemu_bh_new(void (*callback)(void *),void *opaque) {
+    QEMUBH *bh=calloc(1,sizeof(*bh)); assert(bh); bh->callback=callback; bh->opaque=opaque; return bh;
+}
+static void qemu_bh_delete(QEMUBH *bh) { free(bh); }
+static void qemu_bh_schedule(QEMUBH *bh) {
+    assert(bh); atomic_fetch_add(&bh_calls,1);
+    if(bh->callback) dispatch_semaphore_signal(close_ready);
+}
 static dispatch_queue_t queue;
 static dispatch_block_t cancel_handler;
 static IOHIDReportCallback input_cb;
@@ -64,7 +82,14 @@ static void drain(void) {
 }
 static void set_queue(IOHIDDeviceRef d,dispatch_queue_t q) { queue=q; dispatch_queue_set_specific(q,&queue_key,(void *)&queue_key,NULL); }
 static void set_cancel(IOHIDDeviceRef d,dispatch_block_t b) { cancel_handler=Block_copy(b); }
-static void cancel_device(IOHIDDeviceRef d) { dispatch_async(queue,cancel_handler); Block_release(cancel_handler); cancel_handler=NULL; }
+static void cancel_device(IOHIDDeviceRef d) {
+    if(teardown) dispatch_async(queue,^{
+        uint8_t report[60]={0};
+        input_cb(input_ctx,0,NULL,kIOHIDReportTypeInput,0,report,60);
+        removed_cb(input_ctx,0,NULL); late_callbacks++;
+    });
+    dispatch_async(queue,cancel_handler); Block_release(cancel_handler); cancel_handler=NULL;
+}
 static void register_input(IOHIDDeviceRef d,uint8_t *b,CFIndex n,IOHIDReportCallback cb,void *ctx) { assert(n==64);input_cb=cb;input_ctx=ctx; }
 static void register_removed(IOHIDDeviceRef d,IOHIDCallback cb,void *ctx) { removed_cb=cb; }
 static void activate(IOHIDDeviceRef d) { }
@@ -106,7 +131,7 @@ int main(int argc,char **argv) {
     assert(argc==2);const char *mode=argv[1];
     HostHIDState *s=calloc(1,sizeof(*s));assert(s);pthread_mutex_init(&s->lock,NULL);
     s->hid=(IOHIDDeviceRef)CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
-    int bh;s->bh=&bh;s->live=s->configured=true;s->sizes[0][0]=60;
+    s->bh=qemu_bh_new(NULL,s);s->live=s->configured=true;s->sizes[0][0]=60;
     s->busy=true;s->transfer_set=strncmp(mode,"get",3)!=0;s->transfer_len=60;
     memset(s->transfer,0x5a,60);entered=dispatch_semaphore_create(0);release_api=dispatch_semaphore_create(0);
     bool overflow=!strcmp(mode,"overflow");
@@ -121,6 +146,37 @@ int main(int argc,char **argv) {
         return 0;
     }
     native_start(s);
+    if(!strncmp(mode,"unrealize-",10)) {
+        /* Hold the real serial worker; unrealize must retain its state and
+         * return before the driver/cancel barrier can complete. */
+        teardown=true;main_thread=pthread_self();emit_input=false;
+        bool queued=!strcmp(mode,"unrealize-queued");
+        hold=!queued;s->transfer_set=!strstr(mode,"get");
+        s->product=strdup("fixture");close_ready=dispatch_semaphore_create(0);
+        dispatch_suspend(queue);
+        assert(native_report(s,s->transfer_set,1,0,s->transfer,60)==USB_RET_ASYNC);
+        if(!queued) {
+            dispatch_resume(queue);
+            assert(!dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC)));
+        }
+        /* Bounds a broken synchronous implementation instead of hanging CI. */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_global_queue(0,0),^{
+            if(queued) dispatch_resume(queue); else dispatch_semaphore_signal(release_api);
+        });
+        host_hid_unrealize((USBDevice *)s);
+        assert(refs==2 && s->hid && s->product && !s->live && s->closing);
+        assert(!s->pending && !s->waiting && !s->done);
+        assert(dispatch_semaphore_wait(close_ready,DISPATCH_TIME_NOW)!=0);
+        assert(!dispatch_semaphore_wait(close_ready,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC)));
+        assert(!s->hid && !s->dispatch && !s->cancelled && late_callbacks==1);
+        assert(api_calls==(queued?0:1));
+        /* Only the QEMU-side callback may drop the retained QOM reference. */
+        s->bh->callback(s->bh->opaque);
+        assert(refs==1 && !s->bh && !s->product && !s->done);
+        dispatch_release(close_ready);
+        printf("PASS mode=%s retained-until-drain=1 late-callback=1\n",mode);
+        goto cleanup;
+    }
     bool close_queued=!strcmp(mode,"close-queued"), close_running=!strcmp(mode,"close-running");
     bool stale=!strcmp(mode,"reset-queued"), removed=!strcmp(mode,"removed-queued");
     input_first=!strcmp(mode,"input-first");if(!strcmp(mode,"capacity-control"))qlimit=2;
@@ -154,5 +210,7 @@ int main(int argc,char **argv) {
         s->closing=true;native_close(s);
     }
     printf("PASS mode=%s api=%u sync=%u input=%u pending=%u\n",mode,api_calls,sync_calls,input_calls,pending_input);
+cleanup:
+    qemu_bh_delete(s->bh);
     dispatch_release(entered);dispatch_release(release_api);pthread_mutex_destroy(&s->lock);free(s);return 0;
 }

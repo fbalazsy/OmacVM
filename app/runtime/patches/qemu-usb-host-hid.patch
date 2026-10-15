@@ -14,6 +14,8 @@ A full input queue (16 reports; Linux reads only while a program has the
 hidraw node open) drops the oldest report, and a report that does not match
 the descriptor is dropped; both are logged once. The guest loses the device
 only when the Mac does (unplugged, or macOS replaced its HID part).
+Unrealize releases the guest's port immediately; native cancel/drain runs off
+the main loop, retaining the device until a final QEMU bottom half releases it.
 Why: libusb cannot take a device that macOS's HID driver holds without root
 or Apple's com.apple.vm.device-access entitlement. Vendor HID boards (ECU
 tools, bootloaders, programmers) are of no use to macOS but held by it.
@@ -25,7 +27,7 @@ user connects such a device (docs/usb.md).
 
 --- /dev/null
 +++ b/hw/usb/dev-host-hid.c
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,742 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later
 + * usb-host-hid: one vendor HID interface of a Mac USB device, for the guest,
 + * through IOHIDDevice reports (no libusb, no root). QEMU makes the USB
@@ -410,6 +412,10 @@ user connects such a device (docs/usb.md).
 +static void host_hid_realize(USBDevice *dev, Error **errp)
 +{
 +    HostHIDState *s = HOST_HID(dev);
++    if (s->closing) {
++        error_setg(errp, "usb-host-hid closed generation cannot be realized again");
++        return;
++    }
 +    if (!s->registry_id || !s->vendorid || !s->productid || !dev->serial) {
 +        error_setg(errp, "usb-host-hid requires exact registry-id, vendorid, productid and serial");
 +        return;
@@ -442,15 +448,29 @@ user connects such a device (docs/usb.md).
 +    s->live = true;
 +    native_start(s);
 +}
++static void host_hid_closed(void *opaque)
++{
++    HostHIDState *s = opaque;
++    /* QOM teardown belongs to the main AioContext with BQL, not dispatch. */
++    qemu_bh_delete(s->bh); s->bh = NULL;
++    g_clear_pointer(&s->product, g_free);
++    object_unref(OBJECT(s));
++}
 +static void host_hid_unrealize(USBDevice *dev)
 +{
 +    HostHIDState *s = HOST_HID(dev);
 +    qemu_mutex_lock(&s->lock);
 +    s->closing = true; s->live = false; s->pending = s->waiting = NULL;
 +    qemu_mutex_unlock(&s->lock);
-+    native_close(s);
 +    qemu_bh_delete(s->bh); s->bh = NULL;
-+    g_clear_pointer(&s->product, g_free);
++    /* Release the USB port now, retaining buffers, callbacks and lock until
++     * cancel+drain completes. Never wait for driver I/O on the main loop. */
++    object_ref(OBJECT(s));
++    s->bh = qemu_bh_new(host_hid_closed, s);
++    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
++        native_close(s);
++        qemu_bh_schedule(s->bh);
++    });
 +}
 +static void host_hid_init(Object *obj)
 +{

@@ -10,13 +10,14 @@ def main():
     ap.add_argument('--patch',type=Path,default=Path(__file__).resolve().parents[1]/'patches/qemu-usb-host-hid.patch')
     ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--variant',choices=['plain','ubsan','asan'],default='plain')
-    ap.add_argument('--cases',nargs='+',default=['collision','input-first','capacity-control','get-exact','get-short','get-long','set-error','get-error','close-queued','close-running','reset-queued','removed-queued','overflow','malformed'])
+    ap.add_argument('--cases',nargs='+',default=['collision','input-first','capacity-control','get-exact','get-short','get-long','set-error','get-error','close-queued','close-running','reset-queued','removed-queued','overflow','malformed','unrealize-set','unrealize-get','unrealize-queued'])
     a=ap.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     text=a.patch.read_text();m=re.search(r'\+\+\+ b/hw/usb/dev-host-hid.c\n@@ -0,0 \+1,(\d+) @@\n',text)
     assert m
     lines=text[m.end():].splitlines(keepends=True)[:int(m[1])];assert all(x.startswith('+') for x in lines)
     c=''.join(x[1:] for x in lines)
-    fragments=[c[c.index('struct HostHIDState {'):c.index('static bool native_open')],c[c.index('static void host_hid_receive('):c.index('static void host_hid_bh(')],c[c.index('static void native_input('):]]
+    close_start=c.index('static void host_hid_closed(') if 'static void host_hid_closed(' in c else c.index('static void host_hid_unrealize(')
+    fragments=[c[c.index('struct HostHIDState {'):c.index('static bool native_open')],c[c.index('static void host_hid_receive('):c.index('static void host_hid_bh(')],c[close_start:c.index('static void host_hid_init(')],c[c.index('static void native_input('):]]
     (a.output/'native.inc').write_text('\n'.join(fragments))
     env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','HOME':os.environ['HOME'],'TMPDIR':os.environ['TMPDIR'],'LANG':'C','PYTHONDONTWRITEBYTECODE':'1'}
     logs=[]
