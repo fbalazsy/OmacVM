@@ -139,9 +139,10 @@ Until then, other ways work for some of these:
 ### Safety
 
 - With the switch off, QEMU gets no USB controller and never uses USB.
-- With it on, the VM gets an empty USB controller. QEMU opens a device only
-  when you connect it, and only that one: by its bus and address. It never
-  looks for other devices itself.
+- With it on, the VM gets an empty USB controller. Ordinary USB passthrough
+  targets the device you connect, by its bus and address; it does not
+  automatically connect other devices. Its libusb backend can still enumerate
+  other devices and retain their macOS metadata (see Known limits below).
 - A device you connect belongs to the VM while it has it: Linux can do
   anything with it, firmware updates included. Connect only devices you
   would plug into that Linux machine.
@@ -208,3 +209,14 @@ Until then, other ways work for some of these:
   the list: the choice is for the next plug-in.
 - A device that gets another product id when it resets (DFU mode) is a new
   device: OmacVM asks again.
+- Switching a board from ordinary USB back to vendor HID in the same running
+  VM is not reliably supported. After ordinary USB use, QEMU's libusb context
+  can retain macOS device metadata until QEMU exits; the HID safety checks can
+  then refuse the board. Disconnecting it or restarting Linux does not end
+  that context. Once the device's tool has finished and no write or flash is
+  in progress, shut down the VM completely and start it again before retrying.
+  OmacVM does not restart the VM automatically or bypass the HID safety checks.
+- Vendor HID teardown releases the guest USB port without waiting on the QEMU
+  main loop for native report cancellation. Native state is retained until
+  cancellation and queued work finish. This is not a guarantee of immediate
+  native release: a stuck macOS driver can retain that state until QEMU exits.
