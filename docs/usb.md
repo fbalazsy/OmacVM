@@ -108,3 +108,33 @@ device stays attached and transfers before, during and after the transition.
 Keep GUI/remembered-choice acceptance, unplug/replug, sleep/crash, firmware flash,
 installation and update survival as separate gates. A manual headless controller
 using production classes is not a test of the app's visible USB list.
+
+### Qualified physical validation
+
+An isolated ROOT launcher/QEMU pair built from production sources at
+`6a1a1345b613c69a04d945221ccbe32a5b532d85` completed two HID -> bulk -> HID
+cycles under the same process identities while an unrelated ordinary `usb-host`
+storage device remained attached and transferring. ECU reads used guest UID 1000;
+the storage reader required guest root and held one O_DIRECT descriptor per
+stream, recording 179 and 119 successful samples. Repeated application-page and
+fresh native reads matched. The second-cycle trace recorded 3,702 storage data
+requests and completions, with no storage reset/open/close/claim/release events.
+Checked native and guard Close0, lease retirement, storage removal and test-process
+exit were verified. Three host-side 1 MiB storage samples matched their baseline
+after return; the primary VM was unchanged. These continuity runs sent no RAM or
+flash writes.
+
+This separately authorized root fixture is not acceptance of normal nonroot GUI
+storage capture. Earlier nonroot capture was refused as host-owned; initial
+storage capture in the root fixture revoked its first native guard, and the two
+accepted cycles ran after storage capture was established.
+
+The subsequent live-root resolver correction has behavioral RED/GREEN, 15 inert
+resolver/presence cases, the complete offline gate and an optimized controller
+build, but no new exact-binary hardware run. It resolves only a positively matched
+published USB root; matching misses remain unknown and complete registry traversal
+is still required for unregistered-client/absence proofs. Do not attribute the
+earlier physical cycles to these new bytes. Firmware-flash acceptance, actual GUI
+automatic routing, normal nonroot storage capture, installation, sleep/crash and
+update survival remain unverified. This validation update does not deploy a
+candidate or require a privileged application helper.

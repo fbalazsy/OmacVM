@@ -14,12 +14,17 @@ python3 app/tests/test-rootguard-owned-release.py
 
 The runner prints its new output directory. It compiles actual OmacVMUSB sources
 with injected process, transport, registry and guard APIs, then checks typed QMP
-socket envelopes and bounded controller input. The combined runner log includes 253 PASS
+socket envelopes and bounded controller input. The combined runner log includes 254 PASS
 lines, a 97-case guard matrix and four pre-adoption interop controls. It also checks
 canonical uncertain STATUS arriving before guard loss: local authority is revoked,
 the session leaves Connected, and no guard Close occurs before a matching drain. Interop
 peers model the wire contract; the separate runtime handler tests execute C.
-None of these counts is a hardware claim.
+The runner also extracts the actual live-root resolver and registry binding into
+a fake-SDK fixture: 15 cases cover positive published-root lookup despite unrelated
+global-iterator invalidation, refusal/unknown results, reference balance and the
+unchanged complete global presence proof. Its summary adds one PASS record; the
+15 cases are not 15 additional PASS records. None of these counts is a hardware
+claim.
 
 Compile all release products and the direct-child live controller, without
 executing them:
@@ -54,3 +59,20 @@ Record PID/start, exact source/artifact identity, release receipts and restorati
 Do not flash firmware merely to test coexistence. Real firmware flashing, visible
 USB UI, physical removal, crash/sleep, installation and update survival are
 independent acceptance gates.
+
+## Qualified physical evidence and current limits
+
+Production sources at `6a1a1345b613c69a04d945221ccbe32a5b532d85` completed two
+same-QEMU HID/bulk/HID cycles with an unrelated ordinary USB storage attachment
+transferring through one O_DIRECT descriptor per stream in an isolated ROOT
+launcher/QEMU fixture. ECU reads ran as guest UID 1000; storage reads required
+guest root. Matching reads, no storage reset/reopen/close in the second-cycle
+trace, checked Close0, lease retirement, process cleanup and unchanged sampled
+host storage were verified. Initial root-fixture capture revoked the first guard;
+accepted cycles followed established storage capture. This is not normal nonroot
+GUI storage-capture acceptance. See [USB acceptance qualifications](../../docs/usb.md#qualified-physical-validation).
+
+The later positive published-live-root resolver fix has offline/build coverage
+only, not a new physical execution of its controller bytes. Firmware flashing and
+actual GUI automatic routing remain unverified. No installation or deployment is
+part of this evidence update.
