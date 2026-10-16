@@ -6,6 +6,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 python3 app/tests/test-rootguard-interest.py
 python3 app/tests/test-rootguard-registry.py
+python3 app/tests/test-rootguard-live-root.py
 out=$(mktemp -d "$TMPDIR/omacvm-usb-coexistence.XXXXXX")
 printf 'Evidence directory: %s\n' "$out"
 swiftc -num-threads 2 -j2 -warnings-as-errors -DCOEXISTENCE_DI app/app/Sources/OmacVMUSB/*.swift \

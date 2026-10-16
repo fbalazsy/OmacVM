@@ -36,7 +36,16 @@ final class USBRootGuardIOKit: USBRootGuardDriver {
        dispose:{ [unowned self] in self.release() })
 
     private func exactService(_ rootID: UInt64) throws -> io_service_t {
-        guard let s = try registry.service(rootID) else { throw USBRootGuardError.rootAbsent }
+        guard rootID != 0 else { throw USBRootGuardError.refused }
+        // Positive lookup of a published USB root only. A missing match is
+        // unknown, never the full-registry absence proof used during drain.
+        guard let matching = IORegistryEntryIDMatching(rootID) else { throw USBRootGuardError.uncertain }
+        let s = IOServiceGetMatchingService(kIOMainPortDefault,matching)
+        guard s != 0 else { throw USBRootGuardError.uncertain }
+        var id: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(s,&id) == KERN_SUCCESS, id == rootID else {
+            IOObjectRelease(s); throw USBRootGuardError.uncertain
+        }
         guard IOObjectConformsTo(s,"IOUSBHostDevice") != 0,
               service == 0 || IOObjectIsEqualTo(service,s) != 0 else {
             IOObjectRelease(s); throw USBRootGuardError.lost
