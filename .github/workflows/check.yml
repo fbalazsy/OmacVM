@@ -95,6 +95,12 @@ jobs:
       - name: USB vendor HID device in QEMU (report dispatch, full queue; no hardware)
         run: python3 app/runtime/Tests/test-hid-native-dispatch.py --output "$JOB_TMP/hid-native-dispatch"
 
+      - name: USB coexistence recipe and Swift DI (no hardware)
+        run: |
+          python3 app/runtime/Tests/coexistence/test-recipe.py
+          bash app/tests/run-usb-coexistence-offline.sh
+          python3 app/tests/test-rootguard-owned-release.py
+
       - name: Boot splash and start animation (offline, from the patch)
         run: app/runtime/Tests/display/check-boot-splash.sh
 

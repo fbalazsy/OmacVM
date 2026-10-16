@@ -1,0 +1,19 @@
+{
+  "pinned_qemu": "c3d48b7d1e89604920e5b81b91140c2ad39a1943",
+  "base_sha256": {
+    "hw/usb/host-libusb.c": "b2ee27d3e2390c9186cc386703d37cd8d17b49b7d8d450dd8bc3dc22a5e30ced",
+    "hw/usb/dev-host-hid.c": "5071c1628391ac5fd3c99811ce3f237b2c825db7a737524235152c76e0a015eb",
+    "hw/usb/meson.build": "df49fcaf46d72d6387e4d1ec9f8db390269c60bcb2b985a75196ea299e110a16"
+  },
+  "source_sha256": {
+    "hw/usb/dev-host-hid.c": "00ec4d1fdb15ba41f8043a4a57360cd39db79946f13aa78b5e98f13087849808",
+    "hw/usb/host-coexistence-platform.h": "7a71d1b70762c84d02bb2ca45d56b52bd972e2eeab64c833f70c35a8e351c3d9",
+    "hw/usb/host-coexistence-qmp.inc": "83daa57bf725afe8461550e244722b4971f49cbf7f035885f04ac28ae17976c2",
+    "hw/usb/host-coexistence-registry.inc": "f1532c4051990d6213ffafd5309da8dd190bebf66130c4762c50a94b18502137",
+    "hw/usb/host-coexistence.c": "19b0cc9b9f70f7f92fb14fdf8f51db74e9ab81b98c6af374caa17b30347e81db",
+    "hw/usb/host-coexistence.h": "412fec06dda2acbcc6043128300b233fdec20ddfd7ebf632d837ece8a1e0b5fb",
+    "hw/usb/host-libusb.c": "babfabc50b22f92b9a00059774b0eccae528d7041e443a3fc3f0aafc8ab16de9",
+    "hw/usb/meson.build": "870b5772a777cc24194fcdb60ed4ca57426c61f835ac52fc402a5f8dcaa37d18"
+  },
+  "patch_sha256": "d7fcbabdb2eff0c7d50bdff49904b91136cbbd4d908f5912835d01c66595fd5c"
+}

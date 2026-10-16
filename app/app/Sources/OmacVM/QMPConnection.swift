@@ -1,6 +1,7 @@
 // From try-omarchy (github.com/omacom/try-omarchy), MIT, (c) Try Omarchy contributors.
 import Darwin
 import Foundation
+import OmacVMUSB
 
 /// One authenticated connection to QEMU's private machine-protocol socket.
 ///
@@ -105,11 +106,22 @@ final class QMPConnection: @unchecked Sendable {
                 guard let matched = try Self.readResponse(
                     id: identifier,
                     from: descriptor,
-                    timeoutMilliseconds: timeoutMilliseconds
+                    timeoutMilliseconds: timeoutMilliseconds,
+                    strictCoexistence: command.hasPrefix("x-omacvm-usb-coexistence-")
                 ) else {
                     throw HelperError.io("QMP command \(command) timed out")
                 }
                 let response = matched.object
+                if command.hasPrefix("x-omacvm-usb-coexistence-") {
+                    if Set(response.keys) == Set(["id", "error"]),
+                       let e = response["error"] as? [String: Any],
+                       Set(e.keys) == Set(["class", "desc"]),
+                       let kind = e["class"] as? String, let detail = e["desc"] as? String,
+                       kind == "GenericError" || kind == "CommandNotFound" {
+                        throw USBCoexistenceError.rejected(detail)
+                    }
+                    guard Set(response.keys) == Set(["id", "return"]) else { throw USBCoexistenceError.schema }
+                }
                 if let error = response["error"] as? [String: Any] {
                     let detail = error["desc"] as? String ?? "unknown QMP error"
                     throw HelperError.io("QMP command \(command) failed: \(detail)")
@@ -299,25 +311,29 @@ final class QMPConnection: @unchecked Sendable {
     private static func readResponse(
         id: String,
         from descriptor: Int32,
-        timeoutMilliseconds: Int32
+        timeoutMilliseconds: Int32,
+        strictCoexistence: Bool = false
     ) throws -> MatchedResponse? {
         try readResponse(
             id: id,
             from: descriptor,
-            deadline: deadline(afterMilliseconds: timeoutMilliseconds)
+            deadline: deadline(afterMilliseconds: timeoutMilliseconds),
+            strictCoexistence: strictCoexistence
         )
     }
 
     private static func readResponse(
         id: String,
         from descriptor: Int32,
-        deadline: UInt64
+        deadline: UInt64,
+        strictCoexistence: Bool = false
     ) throws -> MatchedResponse? {
         var events: [String] = []
         while DispatchTime.now().uptimeNanoseconds < deadline {
             guard let object = try readJSONObject(
                 from: descriptor,
-                deadline: deadline
+                deadline: deadline,
+                strictCoexistence: strictCoexistence
             ) else {
                 return nil
             }
@@ -333,7 +349,8 @@ final class QMPConnection: @unchecked Sendable {
 
     private static func readJSONObject(
         from descriptor: Int32,
-        deadline: UInt64
+        deadline: UInt64,
+        strictCoexistence: Bool = false
     ) throws -> [String: Any]? {
         var bytes = Data()
         while bytes.count <= 1_048_576 {
@@ -360,6 +377,7 @@ final class QMPConnection: @unchecked Sendable {
             let count = Darwin.read(descriptor, &byte, 1)
             if count == 1 {
                 if byte == 0x0A {
+                    if strictCoexistence { return try USBCoexistenceCodec.decode(bytes) }
                     guard let object = try JSONSerialization.jsonObject(with: bytes)
                         as? [String: Any] else {
                         throw HelperError.io("QMP response is not a JSON object")

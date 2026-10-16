@@ -13,10 +13,15 @@ final class USBRun: ObservableObject {
     let config: VMConfig
     let requestName: String
     private let pid: pid_t
+    private let qemuTask: USBCoexistenceTask?
+    private let launcherTask: USBCoexistenceTask?
     private let log: (String) -> Void
     private let watch: USBWatch
     private let asker = USBAlertAsker()
     private var session: USBSession?
+    private var machine: USBQMPMachine?
+    private let vendorHID: Bool
+    private let launch = USBCoexistenceCodec.launchID()
     private var observers: [NSObjectProtocol] = []
     private var request: NSObjectProtocol?
     private var panel: NSPanel?
@@ -38,8 +43,11 @@ final class USBRun: ObservableObject {
     /// vendorHID: the "Vendor HID devices" switch at this start (USBVendorHID).
     init(config: VMConfig, qemuPID: pid_t, vendorHID: Bool = false, log: @escaping (String) -> Void) {
         self.config = config
-        watch = USBWatch(hid: vendorHID)
+        self.vendorHID = vendorHID
+        watch = USBWatch(hid: vendorHID,coexistencePID:qemuPID)
         self.pid = qemuPID
+        qemuTask = try? USBCoexistenceTask.measure(qemuPID)
+        launcherTask = try? USBCoexistenceTask.measure(getpid())
         self.log = log
         requestName = Self.requestName()
     }
@@ -77,7 +85,14 @@ final class USBRun: ObservableObject {
     private func begin() {
         let folder = config.folder
         let memory = USBMemory.load(folder: folder) { [weak self] in self?.log($0) }
-        let machine = USBQMPMachine(socketPath: config.qmpSocket.path, emulated: fake)
+        guard !stopped, session == nil else { return }
+        let qemuTask = self.qemuTask, launcherTask = self.launcherTask
+        let socket = USBQMPSocket(path:config.qmpSocket.path,emulated:fake,coexistenceTask:qemuTask)
+        let machine = USBQMPMachine(transport:socket,coexistenceFactory:{ [vendorHID,launch] _ in
+            guard vendorHID, let qemuTask, let launcherTask else { return nil }
+            return USBCoexistenceCoordinator(transport:socket,launcher:launcherTask,qemu:qemuTask,launch:launch)
+        })
+        self.machine = machine
         asker.qemuPID = { [pid] in pid }
         let s = USBSession(vmName: config.name, memory: memory, machine: machine, asker: asker, clock: MainClock(),
                            save: { [weak self] m in
@@ -88,6 +103,7 @@ final class USBRun: ObservableObject {
                            log: { [weak self] in self?.log($0) })
         s.onChange = { [weak self] in self?.refreshRows() }
         session = s
+        machine.onCoexistencePhase = { [weak s] phase, device in s?.coexistencePhase(phase,device:device) }
         s.inFront = inFront
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
@@ -105,6 +121,14 @@ final class USBRun: ObservableObject {
             self?.devices[loc] = nil
             self?.session?.unplugged(location: loc)
             self?.refreshRows()
+        }
+        if vendorHID {
+            watch.onUnplugGeneration = { [weak self] loc, root in
+                guard let self else { return }
+                if self.devices[loc]?.coexistenceRootID == root { self.devices[loc] = nil }
+                self.session?.unplugged(location:loc,rootID:root)
+                self.refreshRows()
+            }
         }
         watch.start()
         if fake {
@@ -133,6 +157,8 @@ final class USBRun: ObservableObject {
         guard !stopped else { return }
         stopped = true
         watch.stop()
+        machine?.stop()
+        machine = nil
         session?.stop()
         session = nil
         observers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
@@ -147,7 +173,11 @@ final class USBRun: ObservableObject {
 
     private func refreshRows() {
         guard let s = session else { return }
-        rows = USBListRows.make(memory: s.memory, devices: devices.values.sorted { $0.location < $1.location },
+        var visible = devices
+        for (location,plug) in s.plugs where plug.device.coexistence != nil {
+            if [.connecting,.connected,.disconnecting,.coexistencePending].contains(plug.state) { visible[location] = plug.device }
+        }
+        rows = USBListRows.make(memory: s.memory, devices: visible.values.sorted { $0.location < $1.location },
                                 states: s.plugs.mapValues(\.state), vmName: config.name)
     }
 
@@ -201,53 +231,5 @@ final class USBRun: ObservableObject {
 final class MainClock: USBClock {
     func after(_ seconds: Double, _ run: @escaping () -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: run)
-    }
-}
-
-/// One short QMP connection per command: QEMU's socket serves one client at
-/// a time, and the app's other users (the Vulkan start watch, the fast
-/// network, sleep) must not wait for this one.
-struct USBQMPSocket: USBQMPTransport {
-    let path: String
-    /// Test builds (OMACVM_TEST_USB_FAKE): usb-host becomes QEMU's emulated tablet, same id and bus.
-    var emulated = false
-    func execute(_ command: String, _ arguments: [String: Any]?) throws -> [String: Any] {
-        var args = arguments
-        if emulated, command == "device_add", args?["driver"] as? String == "usb-host" {
-            args = ["driver": "usb-tablet", "id": args?["id"] ?? "", "bus": args?["bus"] ?? ""]
-        }
-        let q = try QMPConnection(socketPath: path, identifierPrefix: "omacvm-usb")
-        defer { q.close() }
-        return try q.execute(command, arguments: args, timeoutMilliseconds: 3_000)
-    }
-}
-
-/// The VM over QMP: one call at a time, in order, off the main thread;
-/// answers back on the main thread.
-final class USBQMPMachine: USBMachine {
-    private let qmp: USBQMPSocket
-    private let queue = DispatchQueue(label: "org.omacvm.usb-qmp", qos: .userInitiated)
-
-    init(socketPath: String, emulated: Bool = false) { qmp = USBQMPSocket(path: socketPath, emulated: emulated) }
-
-    func attach(_ device: USBDevice, done: @escaping (USBAttachResult) -> Void) {
-        queue.async { [qmp] in
-            let r = USBQMP.attach(device, over: qmp)
-            DispatchQueue.main.async { done(r) }
-        }
-    }
-
-    func detach(_ device: USBDevice, done: @escaping (Bool) -> Void) {
-        queue.async { [qmp] in
-            let r = USBQMP.detach(location: device.location, over: qmp)
-            DispatchQueue.main.async { done(r) }
-        }
-    }
-
-    func isAttached(_ device: USBDevice, done: @escaping (Bool) -> Void) {
-        queue.async { [qmp] in
-            let r = (try? USBQMP.attached(over: qmp))?.contains(USBQMP.qemuID(location: device.location)) ?? false
-            DispatchQueue.main.async { done(r) }
-        }
     }
 }

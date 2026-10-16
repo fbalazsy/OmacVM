@@ -14,6 +14,7 @@ if CommandLine.arguments.contains("--list") {
         let a: String
         switch d.availability {
         case .free: a = "free: a VM can have it"
+        case .pendingCoexistence: a = "pending coexistence admission"
         case .usedByMac(let why): a = why
         case .notOffered(let why): a = "not offered: \(why)"
         }

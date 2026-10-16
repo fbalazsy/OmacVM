@@ -1,0 +1,2293 @@
+From: OmacVM
+Subject: [PATCH] usb-host: Darwin session accounting and native lease bridge
+
+What: serialize public-session reservations, retain callback lifetimes and add
+six exact-receipt QMP handlers with an internal one-shot native HID ticket.
+Revoke disables submits, asynchronously cancels/drains/closes, then permits
+exact guard release and generation thaw. Unknown cleanup remains frozen.
+Why: empty queues and device_del are not native-close or ownership receipts.
+Upstream: OmacVM PR427; local Darwin integration, not submitted to QEMU.
+Ordinary transport and official libusb unchanged; no extra context or producer.
+Handle-lifetime synchronous fences, checked cleanup, QOM reentrancy and explicit
+native-neverstarted cleanup ACK. Idle never-leased session refs are reclaimed.
+Included in the normal runtime recipe; the VM's Vendor HID switch stays OFF
+by default. See Tests/coexistence/README.md for portable checks and limits.
+Applies after qemu-usb-host-busy-device.patch at QEMU c3d48b7d1e89604920e5b81b91140c2ad39a1943.
+Test: run-candidate.py, run-dispatch.py, actual QMP/native API fixtures and
+whole-unit actual-core inert lifecycle checks. No hardware is run by these tests.
+
+--- a/hw/usb/dev-host-hid.c
++++ b/hw/usb/dev-host-hid.c
+@@ -11,13 +11,18 @@
+ #include "migration/vmstate.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/error-report.h"
++#include "monitor/qdev.h"
+ #include <IOKit/IOKitLib.h>
+ #include <IOKit/hid/IOHIDDevice.h>
+ #include <dispatch/dispatch.h>
++#include "host-coexistence-platform.h"
+ #define TYPE_HOST_HID "usb-host-hid"
+ OBJECT_DECLARE_SIMPLE_TYPE(HostHIDState, HOST_HID)
+ struct HostHIDState {
+     USBDevice parent_obj;
++    CoexNativeTicket *ticket;
++    bool coex_opening, close_ok;
++    CoexNativeDisposal close_disposal;
+     uint64_t registry_id;
+     uint16_t vendorid, productid;
+     char *product;
+@@ -40,6 +45,7 @@
+     unsigned dropped;
+     bool dropped_logged;
+     IOHIDDeviceRef hid;
++    bool native_opened;
+     dispatch_queue_t dispatch;
+     dispatch_semaphore_t cancelled;
+     uint8_t input[64];
+@@ -52,8 +58,9 @@
+     const char *strings[256];
+     uint8_t hid_desc[9];
+ };
++static void usb_host_coex_native_forget(HostHIDState *s);
+ static bool native_open(HostHIDState *s, Error **errp);
+-static void native_close(HostHIDState *s);
++static bool native_close(HostHIDState *s);
+ static void native_start(HostHIDState *s);
+ static void host_hid_abort(HostHIDState *s);
+ static void host_hid_resume(HostHIDState *s);
+@@ -421,6 +428,18 @@
+ static void host_hid_closed(void *opaque)
+ {
+     HostHIDState *s = opaque;
++    if (!s->close_ok) {
++        usb_host_coex_native_closed(s->ticket, true, false);
++        return; /* Retain native state and handle on unknown closure. */
++    }
++    if (s->ticket) {
++        if (s->close_disposal == COEX_DISPOSAL_OLD_GENERATION_GONE) {
++            if (!usb_host_coex_native_gone_disposed(s->ticket)) { return; }
++        } else {
++            usb_host_coex_native_closed(s->ticket, true, s->close_ok);
++        }
++        usb_host_coex_native_forget(s);
++    }
+     /* QOM teardown belongs to the main AioContext with BQL, not dispatch. */
+     qemu_bh_delete(s->bh); s->bh = NULL;
+     g_clear_pointer(&s->product, g_free);
+@@ -430,15 +449,19 @@
+ {
+     HostHIDState *s = HOST_HID(dev);
+     qemu_mutex_lock(&s->lock);
++    if (s->closing) { qemu_mutex_unlock(&s->lock); return; }
+     s->closing = true; s->live = false; s->pending = s->waiting = NULL;
+     qemu_mutex_unlock(&s->lock);
+-    qemu_bh_delete(s->bh); s->bh = NULL;
++    if (s->ticket) { usb_host_coex_native_revoke(s->ticket); }
++    if (s->bh) { qemu_bh_delete(s->bh); s->bh = NULL; }
+     /* Release the USB port now, retaining buffers, callbacks and lock until
+      * cancel+drain completes. Never wait for driver I/O on the main loop. */
+     object_ref(OBJECT(s));
+     s->bh = qemu_bh_new(host_hid_closed, s);
+     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+-        native_close(s);
++        s->close_ok = native_close(s);
++        /* Failed close retains the object/handle and the ordinary freeze.
++         * Never convert an unknown close result into a completion ACK. */
+         qemu_bh_schedule(s->bh);
+     });
+ }
+@@ -548,10 +571,46 @@
+     CFRelease(props);
+     return ok;
+ }
++typedef struct CoexTree {
++    CoexMeasurement *m;
++    uint64_t cache, guard, native;
++    int guard_pid;
++    bool discover;
++} CoexTree;
++static bool coex_client(io_registry_entry_t entry, CoexTree *tree, bool hid)
++{
++    char creator[512], prefix[64];
++    uint64_t id;
++    CoexMeasurement *m = tree->m;
++    if (IORegistryEntryGetRegistryEntryID(entry, &id) != KERN_SUCCESS || !id) { return false; }
++    int pid;
++    uint64_t *slot;
++    if (hid) {
++        if ((!tree->discover && id != tree->native) || m->native) { return false; }
++        slot = &m->native; pid = m->pid;
++    } else if (tree->guard && id == tree->guard) {
++        slot = &m->guard; pid = tree->guard_pid;
++    } else {
++        if ((tree->cache && id != tree->cache) || m->cache) { return false; }
++        slot = &m->cache; pid = m->pid;
++    }
++    if (*slot) { return false; }
++    CFTypeRef value = IORegistryEntryCreateCFProperty(entry,
++        CFSTR("IOUserClientCreator"), kCFAllocatorDefault, 0);
++    snprintf(prefix, sizeof(prefix), "pid %d, ", pid);
++    bool ok = value && CFGetTypeID(value) == CFStringGetTypeID() &&
++        CFStringGetCString(value, creator, sizeof(creator), kCFStringEncodingUTF8) &&
++        !strncmp(creator, prefix, strlen(prefix)) && creator[strlen(prefix)];
++    if (value) { CFRelease(value); }
++    if (ok) { *slot = id; }
++    return ok;
++}
+ static bool native_tree(io_registry_entry_t entry, uint64_t selected,
+                         unsigned role, unsigned depth, unsigned *budget,
+-                        unsigned counts[3], uint64_t page, uint64_t usage)
+-{
++                        unsigned counts[3], uint64_t page, uint64_t usage,
++                        CoexTree *tree)
++{
++    CoexMeasurement *m = tree ? tree->m : NULL;
+     io_name_t cls;
+     uint64_t p, u, id;
+     if (depth > 8 || !*budget || IOObjectGetClass(entry, cls) != KERN_SUCCESS) { return false; }
+@@ -559,14 +618,24 @@
+     bool hid = !strcmp(cls, "AppleUserHIDDevice") || !strcmp(cls, "IOHIDDevice");
+     unsigned next;
+     if (role == 0 && !strcmp(cls, "IOUSBHostDevice")) { next = 1; }
+-    else if (role == 1 && !strcmp(cls, "IOUSBHostInterface")) { next = 2; counts[0]++; }
++    else if (role == 1 && m && !strcmp(cls, "AppleUSBHostDeviceUserClient")) {
++        if (!coex_client(entry, tree, false)) { return false; }
++        next = 4;
++    }
++    else if (role == 1 && !strcmp(cls, "IOUSBHostInterface")) {
++        if (m && (IORegistryEntryGetRegistryEntryID(entry, &id) != KERN_SUCCESS || id != m->interface)) { return false; }
++        next = 2; counts[0]++;
++    }
+     else if (role == 2 && hid) {
+         if (IORegistryEntryGetRegistryEntryID(entry, &id) != KERN_SUCCESS || id != selected) { return false; }
+         next = 3; counts[1]++;
++    } else if (role == 3 && tree && !strcmp(cls, "IOHIDLibUserClient")) {
++        if (!coex_client(entry, tree, true)) { return false; }
++        next = 4;
+     } else if (role == 3 && !strcmp(cls, "IOHIDInterface")) { next = 4; counts[2]++; }
+     else if (role == 1 && !strcmp(cls, "AppleUSBHostCompositeDevice")) { next = 4; }
+     else { return false; } /* Includes every user client, event/security driver and unknown subclass. */
+-    bool required = next == 3 || (role == 3 && next == 4);
++    bool required = next == 3 || (role == 3 && next == 4 && !strcmp(cls, "IOHIDInterface"));
+     if (!native_metadata(entry, required, &p, &u) ||
+         (required && (p != page || u != usage))) { return false; }
+     if (next == 2) {
+@@ -583,7 +652,7 @@
+     io_object_t child;
+     bool ok = true;
+     while (ok && (child = IOIteratorNext(it))) {
+-        ok = next != 4 && native_tree(child, selected, next, depth + 1, budget, counts, page, usage);
++        ok = next != 4 && native_tree(child, selected, next, depth + 1, budget, counts, page, usage, tree);
+         IOObjectRelease(child);
+     }
+     ok &= IOIteratorIsValid(it);
+@@ -631,10 +700,11 @@
+     }
+     unsigned budget = 64, counts[3] = {0};
+     ok = found && native_root(s, current) &&
+-        native_tree(current, s->registry_id, 0, 0, &budget, counts, page, usage);
++        native_tree(current, s->registry_id, 0, 0, &budget, counts, page, usage, NULL);
+     IOObjectRelease(current);
+     return ok && counts[0] == 1 && counts[1] == 1;
+ }
++#include "host-coexistence-registry.inc"
+ static bool native_open(HostHIDState *s, Error **errp)
+ {
+     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault,
+@@ -643,10 +713,24 @@
+     if (!service) { error_setg(errp, "failed to find the HID device (unplugged)"); return false; }
+     bool eligible = IORegistryEntryGetRegistryEntryID(service, &actual) == KERN_SUCCESS &&
+         actual == s->registry_id && IOObjectConformsTo(service, "IOHIDDevice") &&
+-        native_single_interface(s, service);
++        (s->ticket ? usb_host_coex_native_check(s->ticket, COEX_BEFORE_CREATE, 0, errp) :
++         native_single_interface(s, service));
++    if (eligible && s->ticket) {
++        /* Same metadata/parser admitted exact bytes; copy only from this service. */
++        CFTypeRef d = IORegistryEntryCreateCFProperty(service, CFSTR(kIOHIDReportDescriptorKey), kCFAllocatorDefault, 0);
++        eligible = d && CFGetTypeID(d) == CFDataGetTypeID() && CFDataGetLength(d) > 0 &&
++            CFDataGetLength(d) <= sizeof(s->report_desc);
++        if (eligible) {
++            s->report_desc_len = CFDataGetLength(d);
++            memcpy(s->report_desc, CFDataGetBytePtr(d), s->report_desc_len);
++            eligible = host_hid_parse(s, NULL) &&
++                usb_host_coex_native_descriptor(s->ticket, s->report_desc, s->report_desc_len);
++        }
++        if (d) { CFRelease(d); }
++    }
+     if (eligible) { s->hid = IOHIDDeviceCreate(kCFAllocatorDefault, service); }
+     IOObjectRelease(service);
+-    if (!s->hid) { error_setg(errp, "not a vendor HID device (one vendor-page HID interface, nothing else on it)"); return false; }
++    if (!s->hid) { if (!errp || !*errp) { error_setg(errp, "not a vendor HID device (one vendor-page HID interface, nothing else on it)"); } return false; }
+     g_autofree char *serial = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDSerialNumberKey)));
+     g_autofree char *transport = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDTransportKey)));
+     s->product = native_string(IOHIDDeviceGetProperty(s->hid, CFSTR(kIOHIDProductKey)));
+@@ -659,20 +743,25 @@
+         /* Use only the exact descriptor admitted with the registry metadata. */
+         CFDataGetLength(desc) == s->report_desc_len &&
+         !memcmp(s->report_desc, CFDataGetBytePtr(desc), s->report_desc_len);
++    if (eligible && s->ticket) {
++        eligible = usb_host_coex_native_check(s->ticket, COEX_AFTER_CREATE, 0, errp) &&
++            usb_host_coex_native_check(s->ticket, COEX_BEFORE_OPEN, 0, errp);
++    }
+     if (!eligible) {
+-        error_setg(errp, "HID identity mismatch or unsupported/protected report shape");
+-        CFRelease(s->hid); s->hid = NULL;
++        if (!errp || !*errp) { error_setg(errp, "HID identity mismatch or unsupported/protected report shape"); }
++        if (!s->ticket) { CFRelease(s->hid); s->hid = NULL; }
+         g_clear_pointer(&s->product, g_free);
+         return false;
+     }
+     IOReturn r = IOHIDDeviceOpen(s->hid, kIOHIDOptionsTypeNone);
+     if (r != kIOReturnSuccess) {
+         error_setg(errp, "failed to open the HID device (in use or not allowed): 0x%x", r);
+-        CFRelease(s->hid); s->hid = NULL;
++        if (!s->ticket) { CFRelease(s->hid); s->hid = NULL; }
+         g_clear_pointer(&s->product, g_free);
+         return false;
+     }
+-    return true;
++    s->native_opened = true;
++    return !s->ticket || usb_host_coex_native_check(s->ticket, COEX_AFTER_OPEN, 0, errp);
+ }
+ static void native_input(void *context, IOReturn result, void *sender,
+                          IOHIDReportType type, uint32_t id, uint8_t *data, CFIndex len)
+@@ -708,9 +797,11 @@
+     IOHIDDeviceSetCancelHandler(s->hid, ^{ dispatch_semaphore_signal(s->cancelled); });
+     IOHIDDeviceActivate(s->hid);
+ }
+-static void native_close(HostHIDState *s)
+-{
+-    if (!s->hid) { return; }
++static bool native_close(HostHIDState *s)
++{
++    if (!s->hid) { return true; }
++    bool drained = false;
++    s->close_disposal = COEX_DISPOSAL_NONE;
+     if (s->dispatch) {
+         IOHIDDeviceCancel(s->hid);
+         dispatch_semaphore_wait(s->cancelled, DISPATCH_TIME_FOREVER);
+@@ -719,13 +810,42 @@
+         dispatch_release(s->cancelled);
+         dispatch_release(s->dispatch);
+         s->cancelled = NULL; s->dispatch = NULL;
+-    }
+-    IOHIDDeviceClose(s->hid, kIOHIDOptionsTypeNone);
++        drained = true;
++    }
++    if (s->native_opened) {
++        IOReturn result = IOHIDDeviceClose(s->hid, kIOHIDOptionsTypeNone);
++        if (result != kIOReturnSuccess) {
++            qemu_mutex_lock(&s->lock);
++            bool revoked = s->closing && !s->live;
++            qemu_mutex_unlock(&s->lock);
++            if (!drained || !revoked ||
++                (result != kIOReturnBadArgument && result != kIOReturnNoDevice) ||
++                !usb_host_coex_native_gone(s->ticket)) { return false; }
++            /* A vanished immutable generation is not a successful Close. Drop
++             * only our owned CF reference, after real cancel/worker drain. */
++            CFRelease(s->hid); s->hid = NULL; s->native_opened = false;
++            if (!usb_host_coex_native_gone(s->ticket)) { return false; }
++            s->close_disposal = COEX_DISPOSAL_OLD_GENERATION_GONE;
++            error_report("COEX_NATIVE_DISPOSAL old-generation-gone close-result=0x%08x CFRelease=executed post-release-absence=proven (NOT Close0)", result);
++            return true;
++        }
++        s->native_opened = false;
++        s->close_disposal = COEX_DISPOSAL_CHECKED_CLOSE;
++    } else {
++        s->close_disposal = COEX_DISPOSAL_UNOPENED;
++    }
+     CFRelease(s->hid); s->hid = NULL;
++    if (s->ticket && s->close_disposal == COEX_DISPOSAL_CHECKED_CLOSE) {
++        error_report("COEX_NATIVE_DISPOSAL checked-close close-result=0x00000000 CFRelease=executed");
++    }
++    return true;
+ }
+ static int native_report(HostHIDState *s, bool set, unsigned type,
+                          unsigned id, uint8_t *data, unsigned len)
+ {
++    if (s->ticket && !usb_host_coex_native_check(s->ticket, COEX_SUBMIT, 0, NULL)) {
++        return USB_RET_STALL;
++    }
+     /* Async report completions share IOHID's input notification port and can
+      * consume its only slot. Keep QEMU asynchronous, not the IOHID request. */
+     dispatch_async(s->dispatch, ^{
+@@ -740,3 +860,47 @@
+     });
+     return USB_RET_ASYNC;
+ }
++
++/* Sole internal bridge. The reference is set before realize; it cannot be
++ * supplied through device_add or QOM. All entrypoints here run under BQL. */
++static HostHIDState *coex_device;
++bool usb_host_coex_native_attach(CoexNativeTicket *ticket, QDict *target,
++                                  const char *id, Error **errp)
++{
++    if (coex_device) { error_setg(errp, "COEX_BUSY: native object retained"); return false; }
++    DeviceState *dev = qdev_new(TYPE_HOST_HID);
++    HostHIDState *s = HOST_HID(dev);
++    coex_device = s; s->ticket = ticket; s->coex_opening = true;
++    s->registry_id = g_ascii_strtoull(qdict_get_str(target, "hid-id"), NULL, 10);
++    s->vendorid = qdict_get_int(target, "vendor-id");
++    s->productid = qdict_get_int(target, "product-id");
++    USB_DEVICE(s)->serial = g_strdup(qdict_get_str(target, "serial-utf8"));
++    /* qdev's id registration detects duplicates, no caller ticket property. */
++    BusState *bus = qdev_find_default_bus(DEVICE_GET_CLASS(dev), errp);
++    bool ok = bus && qdev_set_id(dev, g_strdup(id), errp) && qdev_realize(dev, bus, errp);
++    s->coex_opening = false;
++    if (!ok) {
++        usb_host_coex_native_revoke(ticket);
++        usb_host_coex_native_stop(ticket);
++    }
++    return ok;
++}
++void usb_host_coex_native_stop(CoexNativeTicket *ticket)
++{
++    HostHIDState *s = coex_device;
++    if (!s || s->ticket != ticket) { return; }
++    qemu_mutex_lock(&s->lock);
++    s->live = false; /* disable_new_submits, before worker dispatch */
++    qemu_mutex_unlock(&s->lock);
++    if (s->coex_opening || s->closing) { return; }
++    if (qdev_is_realized(DEVICE(s))) { qdev_unrealize(DEVICE(s)); }
++    else { host_hid_unrealize(USB_DEVICE(s)); }
++}
++static void usb_host_coex_native_forget(HostHIDState *s)
++{
++    if (coex_device == s) {
++        coex_device = NULL;
++        object_unparent(OBJECT(s));
++        object_unref(OBJECT(s)); /* bridge qdev_new reference */
++    }
++}
+--- /dev/null
++++ b/hw/usb/host-coexistence-platform.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef USB_HOST_COEXISTENCE_PLATFORM_H
++#define USB_HOST_COEXISTENCE_PLATFORM_H
++#include "qobject/qdict.h"
++#include "qapi/error.h"
++typedef struct libusb_device libusb_device;
++typedef struct CoexMeasurement {
++    uint64_t root, interface, hid, session, cache, guard, native;
++    int pid;
++    unsigned char descriptor[4096];
++    size_t descriptor_len;
++} CoexMeasurement;
++/* BQL only. Public device reference returned; caller releases it. */
++bool usb_host_coex_init(Error **errp);
++libusb_device *usb_host_coex_published(uint64_t session, Error **errp);
++/* True only after successful valid exact-ID enumerations report absence.
++ * Registry errors and invalid iterators are NOT generation loss. */
++bool usb_host_coex_ids_gone(uint64_t root, uint64_t guard, uint64_t native);
++/* Property-only registry read: never creates a plugin, opens or seizes. */
++bool usb_host_coex_measure(QDict *target, int pid, CoexMeasurement *out);
++/* Pre-adoption only: verify immutable metadata and exact cache provenance,
++ * without interpreting new children as an allow-set. Grants no native access. */
++bool usb_host_coex_measure_pending(QDict *target, int pid, uint64_t cache,
++                                     CoexMeasurement *out);
++/* Internal, BQL-only capability. No QOM property exposes it. All fields are
++ * copied from canonical validated coordinator receipts, never request pointers. */
++typedef struct CoexTask { int pid; uint64_t sec, usec; } CoexTask;
++typedef struct CoexLeaseKey {
++    char launch[33]; uint64_t epoch, session, root;
++} CoexLeaseKey;
++typedef struct CoexPublished { CoexMeasurement measured; } CoexPublished;
++typedef struct CoexNativeTicket CoexNativeTicket;
++typedef enum CoexNativeDisposal {
++    COEX_DISPOSAL_NONE, COEX_DISPOSAL_CHECKED_CLOSE, COEX_DISPOSAL_UNOPENED,
++    COEX_DISPOSAL_OLD_GENERATION_GONE
++} CoexNativeDisposal;
++typedef enum CoexNativeStage {
++    COEX_BEFORE_CREATE, COEX_AFTER_CREATE, COEX_BEFORE_OPEN, COEX_AFTER_OPEN, COEX_SUBMIT
++} CoexNativeStage;
++CoexNativeTicket *usb_host_coex_native_reserve(const CoexLeaseKey *key,
++    const CoexPublished *published, uint64_t guard_id,
++    const CoexTask *guard_task, Error **errp);
++bool usb_host_coex_native_check(CoexNativeTicket *ticket,
++    CoexNativeStage stage, uint64_t native_client_id, Error **errp);
++bool usb_host_coex_native_descriptor(CoexNativeTicket *ticket,
++    const uint8_t *data, size_t len);
++void usb_host_coex_native_revoke(CoexNativeTicket *ticket);
++void usb_host_coex_native_closed(CoexNativeTicket *ticket,
++    bool callbacks_drained, bool handle_closed);
++/* Worker-safe exact revoked-ticket proof; snapshots/validates under ledger lock,
++ * never holds it over registry calls. No permission to submit or thaw. */
++bool usb_host_coex_native_gone(CoexNativeTicket *ticket);
++bool usb_host_coex_native_gone_disposed(CoexNativeTicket *ticket);
++/* Platform bridge: exact allow-set; discover permits precisely one new native
++ * ID only after this ticket's Create. Zero IDs mean absence, never wildcard. */
++bool usb_host_coex_measure_clients(QDict *target, int pid, uint64_t cache,
++    uint64_t guard, int guard_pid, uint64_t native, bool discover,
++    CoexMeasurement *out);
++bool usb_host_coex_native_attach(CoexNativeTicket *ticket, QDict *target,
++    const char *id, Error **errp);
++void usb_host_coex_native_stop(CoexNativeTicket *ticket);
++#endif
+--- /dev/null
++++ b/hw/usb/host-coexistence-qmp.inc
+@@ -0,0 +1,740 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Included by the ledger: the same mutex owns receipt and session state.
++ * QMP commands are non-OOB, timers run under BQL. No lock spans platform calls.
++ * Platform work never holds session_lock. Native completion returns under BQL. */
++#include "host-coexistence-platform.h"
++#include "qobject/qnum.h"
++#include "qobject/qstring.h"
++#include "qobject/qbool.h"
++#include "qapi/qmp-registry.h"
++extern QmpCommandList qmp_commands;
++#include "monitor/monitor.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include <libproc.h>
++#include <sys/proc.h>
++
++static QDict *coex_owner, *coex_task, *coex_lease, *coex_published;
++static char coex_launch[33];
++static CoexMeasurement coex_measured;
++static uint64_t coex_sequence, coex_epoch, coex_guard, coex_native;
++static bool coex_cleanup_recorded;
++struct CoexNativeTicket {
++    CoexLeaseKey key;
++    CoexPublished published;
++    CoexTask guard_task;
++    uint64_t guard;
++    uint64_t native;
++    CoexNativeDisposal disposal;
++    unsigned stage;
++    bool consumed, revoked, started, closed;
++};
++static CoexNativeTicket *coex_ticket;
++typedef struct CoexTombstone { QDict *status; struct CoexTombstone *next; } CoexTombstone;
++static CoexTombstone *coex_retired;
++static unsigned coex_retained;
++static int64_t coex_deadline;
++static const char *coex_state;
++static QEMUTimer *coex_timer;
++static int coex_parent_pid;
++static uint64_t coex_parent_sec, coex_parent_usec;
++
++static bool coex_keys(QDict *d, const char *keys)
++{
++    g_auto(GStrv) names = g_strsplit(keys, ",", -1);
++    unsigned n = 0;
++    if (!d) { return false; }
++    for (; names[n]; n++) {
++        if (!qdict_haskey(d, names[n])) { return false; }
++    }
++    return qdict_size(d) == n;
++}
++static bool coex_u64(QDict *d, const char *key, uint64_t *out, bool zero)
++{
++    const char *s = d ? qdict_get_try_str(d, key) : NULL;
++    uint64_t n = 0;
++    if (!s || !*s || (s[0] == '0' && s[1])) { return false; }
++    for (const char *p = s; *p; p++) {
++        if (*p < '0' || *p > '9' || n > (UINT64_MAX - (*p - '0')) / 10) { return false; }
++        n = n * 10 + (*p - '0');
++    }
++    *out = n;
++    return zero || n;
++}
++static void coex_put(QDict *d, const char *key, uint64_t n)
++{
++    g_autofree char *v = g_strdup_printf("%" PRIu64, n);
++    qdict_put_str(d, key, v);
++}
++static bool coex_hex(const char *s, size_t n)
++{
++    return s && strlen(s) == n && strspn(s, "0123456789abcdef") == n;
++}
++static bool coex_int(QDict *d, const char *key, int64_t max, int64_t *n)
++{
++    QNum *v = d ? qobject_to(QNum, qdict_get(d, key)) : NULL;
++    return v && v->kind != QNUM_DOUBLE && qnum_get_try_int(v, n) && *n > 0 && *n <= max;
++}
++static bool coex_task_valid(QDict *d)
++{
++    uint64_t sec, usec;
++    int64_t pid;
++    return coex_keys(d, "pid,start-sec,start-usec") &&
++        coex_int(d, "pid", INT_MAX, &pid) &&
++        coex_u64(d, "start-sec", &sec, true) &&
++        coex_u64(d, "start-usec", &usec, true) && usec <= 999999;
++}
++static bool coex_owner_valid(QDict *d)
++{
++    return coex_keys(d, "launch,task") &&
++        coex_hex(qdict_get_try_str(d, "launch"), 32) &&
++        coex_task_valid(qdict_get_qdict(d, "task"));
++}
++static bool coex_target_valid(QDict *d)
++{
++    uint64_t n;
++    int64_t v;
++    const char *s;
++    if (!coex_keys(d, "root-id,interface-id,hid-id,vendor-id,product-id,serial-utf8,descriptor-sha256")) { return false; }
++    s = qdict_get_try_str(d, "serial-utf8");
++    return coex_u64(d, "root-id", &n, false) &&
++        coex_u64(d, "interface-id", &n, false) && coex_u64(d, "hid-id", &n, false) &&
++        coex_int(d, "vendor-id", 65535, &v) && coex_int(d, "product-id", 65535, &v) &&
++        s && *s && strlen(s) <= 256 && g_utf8_validate(s, -1, NULL) &&
++        coex_hex(qdict_get_try_str(d, "descriptor-sha256"), 64);
++}
++static QDict *coex_read_task(int pid)
++{
++    struct proc_bsdinfo info;
++    QDict *d;
++    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info) ||
++        info.pbi_status == SZOMB) { return NULL; }
++    d = qdict_new();
++    qdict_put_int(d, "pid", pid);
++    coex_put(d, "start-sec", info.pbi_start_tvsec);
++    coex_put(d, "start-usec", info.pbi_start_tvusec);
++    return d;
++}
++static bool coex_published_valid(QDict *d)
++{
++    uint64_t n;
++    return coex_keys(d, "target,session,cache-client-id,qemu-task") &&
++        coex_target_valid(qdict_get_qdict(d, "target")) &&
++        coex_task_valid(qdict_get_qdict(d, "qemu-task")) &&
++        coex_u64(d, "session", &n, false) && coex_u64(d, "cache-client-id", &n, false);
++}
++static bool coex_measure_equal(const CoexMeasurement *a, const CoexMeasurement *b)
++{
++    return a->root == b->root && a->interface == b->interface && a->hid == b->hid &&
++        a->session == b->session && a->cache == b->cache && a->pid == b->pid &&
++        a->descriptor_len == b->descriptor_len && a->descriptor_len <= sizeof(a->descriptor) &&
++        !memcmp(a->descriptor, b->descriptor, a->descriptor_len);
++}
++static bool coex_parent_matches(QDict *task)
++{
++    uint64_t sec, usec;
++    return coex_task_valid(task) && qdict_get_int(task, "pid") == coex_parent_pid &&
++        coex_u64(task, "start-sec", &sec, true) && sec == coex_parent_sec &&
++        coex_u64(task, "start-usec", &usec, true) && usec == coex_parent_usec;
++}
++static bool coex_alive(void)
++{
++    QDict *task = coex_read_task(coex_parent_pid);
++    bool ok = task && coex_parent_matches(task);
++    qobject_unref(task);
++    return ok;
++}
++static bool coex_active(void)
++{
++    return coex_state && (!strcmp(coex_state, "freezing") || !strcmp(coex_state, "guard-pending") || !strcmp(coex_state, "native"));
++}
++/* No native ticket has ever existed in this epoch. A canonical cleanup handoff
++ * plus real ordinary drain therefore proves native-neverstarted. An admitted
++ * ticket, including failed Create, always needs its actual close completion. */
++static void coex_neverstarted_ack(void)
++{
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(coex_measured.session);
++    if (coex_state && !strcmp(coex_state, "revoking") &&
++        coex_cleanup_recorded && !coex_ticket && !coex_native && s &&
++        s->frozen && s->epoch == coex_epoch && !s->handles && !s->transfers &&
++        !s->callbacks && !s->uncertain && !accounting_failed) {
++        coex_state = "guard-release";
++    }
++    pthread_mutex_unlock(&session_lock);
++}
++static void coex_revoke(void)
++{
++    pthread_mutex_lock(&session_lock);
++    if (coex_state && strcmp(coex_state, "retired") && strcmp(coex_state, "uncertain")) {
++        coex_state = coex_ticket && coex_ticket->closed ? "guard-release" : "revoking";
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (coex_ticket) { usb_host_coex_native_revoke(coex_ticket); }
++    coex_neverstarted_ack();
++}
++static bool coex_generation(void)
++{
++    bool ok;
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(coex_measured.session);
++    ok = s && s->epoch == coex_epoch && s->frozen && !s->handles &&
++        !s->transfers && !s->callbacks && !s->uncertain && !accounting_failed;
++    pthread_mutex_unlock(&session_lock);
++    return ok;
++}
++static bool coex_public_generation(void)
++{
++    Error *err = NULL;
++    libusb_device *dev = usb_host_coex_published(coex_measured.session, &err);
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(coex_measured.session);
++    bool ok = dev && s && s->dev == dev && s->epoch == coex_epoch && s->frozen &&
++        !s->handles && !s->transfers && !s->callbacks && !s->uncertain && !accounting_failed;
++    pthread_mutex_unlock(&session_lock);
++    if (dev) { libusb_unref_device(dev); }
++    error_free(err);
++    return ok;
++}
++static bool coex_tree(uint64_t guard, uint64_t native, bool discover,
++                      CoexMeasurement *m)
++{
++    return usb_host_coex_measure_clients(qdict_get_qdict(coex_published, "target"),
++        getpid(), coex_measured.cache, guard, coex_parent_pid, native, discover, m) &&
++        coex_measure_equal(m, &coex_measured) && m->guard == guard &&
++        (discover ? m->native != 0 : m->native == native);
++}
++static bool coex_ticket_current(CoexNativeTicket *t)
++{
++    return t && t == coex_ticket && t->key.epoch == coex_epoch &&
++        t->key.session == coex_measured.session && t->key.root == coex_measured.root &&
++        !strcmp(t->key.launch, coex_launch);
++}
++CoexNativeTicket *usb_host_coex_native_reserve(const CoexLeaseKey *key,
++    const CoexPublished *published, uint64_t guard_id,
++    const CoexTask *guard_task, Error **errp)
++{
++    CoexMeasurement m = {0};
++    if (!key || !published || !guard_task || coex_ticket || !guard_id ||
++        key->epoch != coex_epoch || key->session != coex_measured.session ||
++        key->root != coex_measured.root || strcmp(key->launch, coex_launch) ||
++        !coex_measure_equal(&published->measured, &coex_measured) ||
++        guard_task->pid != coex_parent_pid || guard_task->sec != coex_parent_sec ||
++        guard_task->usec != coex_parent_usec || !coex_alive() ||
++        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= coex_deadline ||
++        !coex_state || strcmp(coex_state, "guard-pending") ||
++        !coex_public_generation() || !coex_tree(guard_id, 0, false, &m)) {
++        error_setg(errp, "COEX_IDENTITY: native reservation rejected"); return NULL;
++    }
++    /* Recheck the epoch following the unlocked registry result. */
++    if (!coex_generation() || key->epoch != coex_epoch) {
++        error_setg(errp, "COEX_STALE: reservation changed"); return NULL;
++    }
++    pthread_mutex_lock(&session_lock);
++    coex_ticket = g_new0(CoexNativeTicket, 1);
++    coex_ticket->key = *key; coex_ticket->published = *published;
++    coex_ticket->guard_task = *guard_task; coex_ticket->guard = guard_id;
++    coex_guard = guard_id;
++    pthread_mutex_unlock(&session_lock);
++    return coex_ticket;
++}
++bool usb_host_coex_native_check(CoexNativeTicket *t, CoexNativeStage stage,
++                                 uint64_t native_client_id, Error **errp)
++{
++    CoexMeasurement m = {0};
++    if (!coex_ticket_current(t)) {
++        error_setg(errp, "COEX_STALE: native ticket belongs to another epoch"); return false;
++    }
++    bool order = t && ((stage == COEX_BEFORE_CREATE && !t->consumed) ||
++        (stage == COEX_AFTER_CREATE && t->consumed && t->stage == 1) ||
++        (stage == COEX_BEFORE_OPEN && t->stage == 2) ||
++        (stage == COEX_AFTER_OPEN && t->stage == 3) ||
++        (stage == COEX_SUBMIT && t->stage == 4));
++    if (!coex_ticket_current(t) || !order || t->revoked || t->closed ||
++        !coex_active() || !coex_alive() ||
++        qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= coex_deadline ||
++        !coex_public_generation() || (native_client_id && native_client_id != coex_native) ||
++        !coex_tree(coex_guard, coex_native, stage == COEX_AFTER_OPEN, &m) ||
++        !coex_ticket_current(t) || !coex_generation()) {
++        error_setg(errp, "COEX_POLICY: native stage/epoch/exact clients rejected");
++        coex_revoke(); return false;
++    }
++    pthread_mutex_lock(&session_lock);
++    if (stage == COEX_BEFORE_CREATE) { t->consumed = true; t->stage = 1; }
++    if (stage == COEX_AFTER_CREATE) { t->stage = 2; }
++    if (stage == COEX_AFTER_OPEN) { coex_native = t->native = m.native; t->stage = 4; }
++    if (stage == COEX_BEFORE_OPEN) { t->stage = 3; }
++    if (stage == COEX_SUBMIT) { t->started = true; }
++    pthread_mutex_unlock(&session_lock);
++    return true;
++}
++bool usb_host_coex_native_descriptor(CoexNativeTicket *t,
++                                      const uint8_t *data, size_t len)
++{
++    if (!coex_ticket_current(t)) { return false; }
++    const CoexMeasurement *m = &t->published.measured;
++    bool ok = !t->revoked && !t->closed && data && len == m->descriptor_len &&
++        len <= sizeof(m->descriptor) && !memcmp(data, m->descriptor, len);
++    if (!ok) { coex_revoke(); }
++    return ok;
++}
++void usb_host_coex_native_revoke(CoexNativeTicket *t)
++{
++    if (!coex_ticket_current(t) || t->revoked) { return; }
++    pthread_mutex_lock(&session_lock);
++    t->revoked = true;
++    if (!t->closed && strcmp(coex_state, "uncertain")) { coex_state = "revoking"; }
++    pthread_mutex_unlock(&session_lock);
++    usb_host_coex_native_stop(t); /* disables submits before scheduling close */
++}
++void usb_host_coex_native_closed(CoexNativeTicket *t, bool drained, bool closed)
++{
++    if (!coex_ticket_current(t) || !t->revoked || t->closed) { return; }
++    if (!drained || !closed) {
++        pthread_mutex_lock(&session_lock);
++        USBHostSession *s = session_find(t->key.session);
++        if (s && s->epoch == t->key.epoch) { s->uncertain = true; }
++        coex_state = "uncertain";
++        pthread_mutex_unlock(&session_lock);
++        return;
++    }
++    if (!coex_generation()) { return; }
++    pthread_mutex_lock(&session_lock);
++    t->closed = true;
++    t->disposal = COEX_DISPOSAL_CHECKED_CLOSE;
++    coex_state = "guard-release";
++    pthread_mutex_unlock(&session_lock);
++}
++/* Called by the cleanup worker only AFTER actual cancel + serial queue drain.
++ * All mutable coordinator/ledger state is accessed under session_lock. The
++ * immutable post-Open IDs are copied, then checked again after the bounded
++ * registry traversal. No QDict, public libusb or QMP call occurs under lock. */
++static bool coex_gone_eligible(CoexNativeTicket *t)
++{
++    if (!coex_ticket_current(t)) { return false; }
++    USBHostSession *s = t ? session_find(t->key.session) : NULL;
++    return coex_ticket_current(t) && t->revoked && t->consumed && t->stage == 4 &&
++        !t->closed && t->guard && t->native && t->key.root &&
++        t->key.root != t->guard && t->key.root != t->native && t->guard != t->native &&
++        t->guard == coex_guard && t->native == coex_native &&
++        t->published.measured.root == t->key.root &&
++        coex_measure_equal(&t->published.measured, &coex_measured) &&
++        t->guard_task.pid == coex_parent_pid && t->guard_task.sec == coex_parent_sec &&
++        t->guard_task.usec == coex_parent_usec && coex_cleanup_recorded &&
++        coex_state && !strcmp(coex_state, "revoking") && s && s->dev && s->retained &&
++        s->frozen && s->epoch == t->key.epoch && !s->handles && !s->transfers &&
++        !s->callbacks && !s->uncertain && !accounting_failed;
++}
++bool usb_host_coex_native_gone(CoexNativeTicket *t)
++{
++    CoexLeaseKey key = {0};
++    uint64_t guard = 0, native = 0;
++    pthread_mutex_lock(&session_lock);
++    bool ok = coex_gone_eligible(t);
++    if (ok) { key = t->key; guard = t->guard; native = t->native; }
++    pthread_mutex_unlock(&session_lock);
++    if (!ok || !usb_host_coex_ids_gone(key.root, guard, native)) { return false; }
++    pthread_mutex_lock(&session_lock);
++    ok = coex_gone_eligible(t) && t->key.epoch == key.epoch &&
++        t->key.session == key.session && t->key.root == key.root &&
++        !strcmp(t->key.launch, key.launch) && t->guard == guard && t->native == native;
++    pthread_mutex_unlock(&session_lock);
++    return ok;
++}
++bool usb_host_coex_native_gone_disposed(CoexNativeTicket *t)
++{
++    /* Worker has executed CFRelease and its post-release exact-ID proof. Recheck
++     * once more on the BQL completion; never reinterpret this as Close0. */
++    if (!usb_host_coex_native_gone(t)) {
++        usb_host_coex_native_closed(t, true, false);
++        return false;
++    }
++    pthread_mutex_lock(&session_lock);
++    bool ok = coex_gone_eligible(t);
++    if (ok) {
++        t->closed = true;
++        t->disposal = COEX_DISPOSAL_OLD_GENERATION_GONE;
++        coex_state = "guard-release";
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (!ok) { usb_host_coex_native_closed(t, true, false); }
++    return ok;
++}
++static bool coex_recheck(void)
++{
++    CoexMeasurement m = {0};
++    libusb_device *dev;
++    Error *err = NULL;
++    bool ok;
++    if (!coex_alive() || qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= coex_deadline) { return false; }
++    if (!coex_ticket && !coex_cleanup_recorded) {
++        if (!usb_host_coex_measure_pending(qdict_get_qdict(coex_published, "target"),
++             getpid(), coex_measured.cache, &m) ||
++             !coex_measure_equal(&m, &coex_measured)) { return false; }
++    } else if (!coex_tree(coex_guard, coex_native, false, &m)) { return false; }
++    dev = usb_host_coex_published(m.session, &err);
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(m.session);
++    ok = dev && s && s->dev == dev && s->epoch == coex_epoch && !s->uncertain && !accounting_failed;
++    pthread_mutex_unlock(&session_lock);
++    if (dev) { libusb_unref_device(dev); }
++    error_free(err);
++    return ok;
++}
++static void coex_watchdog(void *opaque)
++{
++    if (coex_active() && !coex_recheck()) { coex_revoke(); }
++    if (coex_active()) { timer_mod(coex_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 250); }
++}
++static QDict *coex_status(void)
++{
++    QDict *d = qdict_new();
++    coex_neverstarted_ack();
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(coex_measured.session);
++    bool poison = !s || s->uncertain || accounting_failed;
++    if (poison && coex_active()) { coex_state = "uncertain"; }
++    pthread_mutex_unlock(&session_lock);
++    if (poison && coex_ticket) { usb_host_coex_native_revoke(coex_ticket); }
++    pthread_mutex_lock(&session_lock);
++    s = session_find(coex_measured.session);
++    bool uncertain = !s || s->uncertain || accounting_failed;
++    if (coex_active() && uncertain) { coex_state = "uncertain"; }
++    if (coex_active() && strcmp(coex_state, "native") && s && !s->handles && !s->transfers && !s->callbacks) { coex_state = "guard-pending"; }
++    qdict_put(d, "lease", qobject_ref(coex_lease));
++    qdict_put(d, "published", qobject_ref(coex_published));
++    coex_put(d, "sequence", coex_sequence);
++    qdict_put_str(d, "state", coex_state);
++    coex_put(d, "guard-client-id", coex_guard);
++    coex_put(d, "native-client-id", coex_native);
++    coex_put(d, "handles", s ? s->handles : 0);
++    coex_put(d, "transfers", s ? s->transfers : 0);
++    coex_put(d, "callbacks", s ? s->callbacks : 0);
++    qdict_put_bool(d, "uncertain", uncertain);
++    pthread_mutex_unlock(&session_lock);
++    return d;
++}
++static bool coex_lease_valid(QDict *d)
++{
++    uint64_t n;
++    return coex_keys(d, "qemu-launch,launcher,lease-epoch") &&
++        coex_hex(qdict_get_try_str(d, "qemu-launch"), 32) &&
++        coex_owner_valid(qdict_get_qdict(d, "launcher")) &&
++        coex_u64(d, "lease-epoch", &n, false);
++}
++static bool coex_call(QDict *call, Error **errp)
++{
++    uint64_t seq;
++    if (!coex_keys(call, "lease,sequence") ||
++        !coex_lease_valid(qdict_get_qdict(call, "lease")) ||
++        !coex_u64(call, "sequence", &seq, false)) {
++        error_setg(errp, "COEX_SCHEMA: invalid Call"); return false;
++    }
++    if (!coex_lease || !qobject_is_equal(QOBJECT(qdict_get_qdict(call, "lease")), QOBJECT(coex_lease))) {
++        error_setg(errp, "COEX_STALE: unknown lease"); return false;
++    }
++    if (coex_sequence == UINT64_MAX || seq != coex_sequence + 1) {
++        coex_revoke(); error_setg(errp, "COEX_STALE: replay or sequence gap revokes lease"); return false;
++    }
++    if (coex_active() && (!coex_alive() || qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= coex_deadline)) { coex_revoke(); }
++    return true;
++}
++static void coex_prepare(QDict *args, QObject **ret, Error **errp)
++{
++    QDict *owner = qdict_get_qdict(args, "launcher");
++    QDict *target = qdict_get_qdict(args, "target");
++    CoexMeasurement first = {0}, second = {0};
++    uint64_t seq, epoch;
++    libusb_device *dev;
++    if (!coex_keys(args, "launcher,sequence,target") || !coex_owner_valid(owner) ||
++        !coex_target_valid(target) || !coex_u64(args, "sequence", &seq, false) || seq != 1) {
++        error_setg(errp, "COEX_SCHEMA: invalid prepare"); return;
++    }
++    if (!coex_parent_matches(qdict_get_qdict(owner, "task")) || !coex_alive() ||
++        !coex_task || (coex_owner && !qobject_is_equal(QOBJECT(owner), QOBJECT(coex_owner)))) {
++        error_setg(errp, "COEX_IDENTITY: launcher is not startup parent"); return;
++    }
++    if (coex_state && !strcmp(coex_state, "retired")) {
++        pthread_mutex_lock(&session_lock);
++        qobject_unref(coex_lease); coex_lease = NULL;
++        qobject_unref(coex_published); coex_published = NULL;
++        coex_ticket = NULL; coex_guard = coex_native = 0;
++        coex_cleanup_recorded = false;
++        coex_state = NULL;
++        pthread_mutex_unlock(&session_lock);
++    }
++    if (coex_retained >= 4096) { error_setg(errp, "COEX_BUSY: retained lease bound"); return; }
++    if (coex_lease) {
++        if (qobject_is_equal(QOBJECT(target), qdict_get(coex_published, "target"))) { coex_revoke(); }
++        error_setg(errp, "COEX_BUSY: generation retained; prepare replay revokes same target"); return;
++    }
++    /* Init singleton before registry measurement: discovery may create cache. */
++    if (!usb_host_coex_init(errp)) { return; }
++    if (!usb_host_coex_measure(target, getpid(), &first)) {
++        error_setg(errp, "COEX_POLICY: exact root/cache/protected identity rejected"); return;
++    }
++    dev = usb_host_coex_published(first.session, errp);
++    if (!dev) { return; }
++    if (!usb_host_coex_measure(target, getpid(), &second) || !coex_measure_equal(&first, &second)) {
++        libusb_unref_device(dev); error_setg(errp, "COEX_IDENTITY: publication changed generation"); return;
++    }
++    if (!usb_host_session_freeze(dev, &epoch)) {
++        libusb_unref_device(dev); error_setg(errp, "COEX_BUSY: session already frozen"); return;
++    }
++    libusb_unref_device(dev);
++    pthread_mutex_lock(&session_lock);
++    if (!coex_owner) {
++        coex_owner = qdict_clone_shallow(owner);
++        qdict_put(coex_owner, "task", qdict_clone_shallow(qdict_get_qdict(owner, "task")));
++    }
++    coex_measured = first;
++    coex_epoch = epoch;
++    coex_sequence = 1;
++    coex_state = "freezing";
++    coex_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000;
++    coex_lease = qdict_new();
++    qdict_put_str(coex_lease, "qemu-launch", coex_launch);
++    qdict_put(coex_lease, "launcher", qobject_ref(coex_owner));
++    coex_put(coex_lease, "lease-epoch", epoch);
++    coex_published = qdict_new();
++    qdict_put(coex_published, "target", qdict_clone_shallow(target));
++    coex_put(coex_published, "session", first.session);
++    coex_put(coex_published, "cache-client-id", first.cache);
++    qdict_put(coex_published, "qemu-task", qobject_ref(coex_task));
++    pthread_mutex_unlock(&session_lock);
++    if (!coex_timer) { coex_timer = timer_new_ms(QEMU_CLOCK_REALTIME, coex_watchdog, NULL); }
++    timer_mod(coex_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 250);
++    if (!coex_recheck()) { coex_revoke(); }
++    *ret = QOBJECT(coex_status());
++}
++static void coex_query(QDict *args, QObject **ret, Error **errp)
++{
++    bool exact = coex_keys(args, "lease");
++    bool lookup = coex_keys(args, "launcher,target");
++    if ((!exact && !lookup) ||
++        (exact && !coex_lease_valid(qdict_get_qdict(args, "lease"))) ||
++        (lookup && (!coex_owner_valid(qdict_get_qdict(args, "launcher")) ||
++                    !coex_target_valid(qdict_get_qdict(args, "target"))))) {
++        error_setg(errp, "COEX_SCHEMA: status requires Lease OR launcher+target"); return;
++    }
++    for (CoexTombstone *t = coex_retired; t; t = t->next) {
++        if ((exact && qobject_is_equal(qdict_get(args, "lease"), qdict_get(t->status, "lease"))) ||
++            (lookup && !coex_lease && qobject_is_equal(qdict_get(args, "launcher"), QOBJECT(coex_owner)) &&
++             qobject_is_equal(qdict_get(args, "target"), qdict_get(qdict_get_qdict(t->status, "published"), "target")))) {
++            *ret = QOBJECT(qdict_clone_shallow(t->status)); return;
++        }
++    }
++    if (!coex_lease ||
++        (exact && !qobject_is_equal(QOBJECT(qdict_get_qdict(args, "lease")), QOBJECT(coex_lease))) ||
++        (lookup && (!qobject_is_equal(QOBJECT(qdict_get_qdict(args, "launcher")), QOBJECT(coex_owner)) ||
++                    !qobject_is_equal(QOBJECT(qdict_get_qdict(args, "target")), qdict_get(coex_published, "target"))))) {
++        error_setg(errp, "COEX_STALE: no exact retained receipt"); return;
++    }
++    if (coex_active() && !coex_recheck()) { coex_revoke(); }
++    *ret = QOBJECT(coex_status());
++}
++static void coex_renew(QDict *args, QObject **ret, Error **errp)
++{
++    uint64_t guard;
++    QDict *call = qdict_get_qdict(args, "call");
++    if (!coex_keys(args, "call,published,guard-client-id,guard-task") ||
++        !coex_published_valid(qdict_get_qdict(args, "published")) ||
++        !coex_task_valid(qdict_get_qdict(args, "guard-task")) ||
++        !coex_u64(args, "guard-client-id", &guard, true)) {
++        error_setg(errp, "COEX_SCHEMA: invalid renew"); return;
++    }
++    if (!coex_call(call, errp)) { return; }
++    if (!qobject_is_equal(qdict_get(args, "published"), QOBJECT(coex_published)) || guard != coex_guard ||
++        !qobject_is_equal(qdict_get(args, "guard-task"), qdict_get(coex_owner, "task"))) {
++        coex_revoke(); error_setg(errp, "COEX_IDENTITY: immutable receipt mismatch"); return;
++    }
++    if (coex_active() && !coex_recheck()) { coex_revoke(); }
++    if (!coex_active()) { error_setg(errp, "COEX_UNCERTAIN: revoked generation cannot renew"); return; }
++    pthread_mutex_lock(&session_lock);
++    coex_u64(call, "sequence", &coex_sequence, false);
++    coex_deadline = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000;
++    pthread_mutex_unlock(&session_lock);
++    *ret = QOBJECT(coex_status());
++}
++static void coex_cancel(QDict *args, QObject **ret, Error **errp)
++{
++    const char *reason = qdict_get_try_str(args, "reason");
++    bool cleanup = coex_keys(args, "call,reason,published,guard-client-id,guard-task");
++    uint64_t guard = 0;
++    if ((!coex_keys(args, "call,reason") && !cleanup) || !reason ||
++        (cleanup && (!coex_published_valid(qdict_get_qdict(args, "published")) ||
++                     !coex_task_valid(qdict_get_qdict(args, "guard-task")) ||
++                     !coex_u64(args, "guard-client-id", &guard, true))) ||
++        (strcmp(reason, "user") && strcmp(reason, "requesting-close") && strcmp(reason, "guard-loss") &&
++         strcmp(reason, "policy-change") && strcmp(reason, "attach-failed") && strcmp(reason, "shutdown"))) {
++        error_setg(errp, "COEX_SCHEMA: invalid revoke"); return;
++    }
++    if (!coex_call(qdict_get_qdict(args, "call"), errp)) { return; }
++    if (cleanup) {
++        if (!qobject_is_equal(qdict_get(args, "published"), QOBJECT(coex_published)) ||
++            !qobject_is_equal(qdict_get(args, "guard-task"), qdict_get(coex_owner, "task")) ||
++            (coex_cleanup_recorded && guard != coex_guard) ||
++            !strcmp(coex_state, "retired")) {
++            coex_revoke(); error_setg(errp, "COEX_IDENTITY: cleanup receipt mismatch"); return;
++        }
++        pthread_mutex_lock(&session_lock);
++        coex_guard = guard;
++        coex_cleanup_recorded = true;
++        pthread_mutex_unlock(&session_lock);
++    }
++    coex_revoke();
++    pthread_mutex_lock(&session_lock);
++    coex_u64(qdict_get_qdict(args, "call"), "sequence", &coex_sequence, false);
++    pthread_mutex_unlock(&session_lock);
++    *ret = QOBJECT(coex_status());
++}
++static void coex_commit(QDict *args, QObject **ret, Error **errp)
++{
++    uint64_t guard;
++    const char *open = qdict_get_try_str(args, "guard-open");
++    const char *id = qdict_get_try_str(args, "device-id");
++    QDict *call = qdict_get_qdict(args, "call");
++    if (!coex_keys(args, "call,published,guard-client-id,guard-task,guard-open,device-id") ||
++        !coex_published_valid(qdict_get_qdict(args, "published")) ||
++        !coex_task_valid(qdict_get_qdict(args, "guard-task")) ||
++        !coex_u64(args, "guard-client-id", &guard, false) ||
++        !open || strcmp(open, "nonseizing-success") || !id || !*id || strlen(id) > 64 ||
++        strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-") != strlen(id)) {
++        error_setg(errp, "COEX_SCHEMA: invalid commit"); return;
++    }
++    if (!coex_call(call, errp)) { return; }
++    if (!qobject_is_equal(qdict_get(args, "published"), QOBJECT(coex_published)) ||
++        !qobject_is_equal(qdict_get(args, "guard-task"), qdict_get(coex_owner, "task"))) {
++        coex_revoke(); error_setg(errp, "COEX_IDENTITY: commit receipt mismatch"); return;
++    }
++    /* Retain the launcher's exact acquired ID even when reservation fails
++     * before adoption. It is a cleanup receipt, never native admission proof. */
++    if ((coex_cleanup_recorded && coex_guard != guard) ||
++        !strcmp(coex_state, "retired") || !strcmp(coex_state, "guard-release")) {
++        coex_revoke(); error_setg(errp, "COEX_IDENTITY: guard ID cannot be replaced"); return;
++    }
++    pthread_mutex_lock(&session_lock);
++    coex_guard = guard;
++    coex_cleanup_recorded = true;
++    pthread_mutex_unlock(&session_lock);
++    CoexLeaseKey key = {.epoch = coex_epoch, .session = coex_measured.session, .root = coex_measured.root};
++    memcpy(key.launch, coex_launch, sizeof(key.launch));
++    CoexPublished published = {.measured = coex_measured};
++    CoexTask task = {.pid = coex_parent_pid, .sec = coex_parent_sec, .usec = coex_parent_usec};
++    CoexNativeTicket *t = usb_host_coex_native_reserve(&key, &published, guard, &task, errp);
++    if (!t) { coex_revoke(); return; }
++    pthread_mutex_lock(&session_lock);
++    coex_u64(call, "sequence", &coex_sequence, false);
++    pthread_mutex_unlock(&session_lock);
++    if (!usb_host_coex_native_attach(t, qdict_get_qdict(coex_published, "target"), id, errp)) {
++        coex_revoke(); return;
++    }
++    if (!usb_host_coex_native_check(t, COEX_SUBMIT, coex_native, errp)) { return; }
++    pthread_mutex_lock(&session_lock);
++    coex_state = "native";
++    pthread_mutex_unlock(&session_lock);
++    *ret = QOBJECT(coex_status());
++}
++/* session_lock held. A launcher disposal assertion cannot create a native ACK.
++ * Only the exact post-Open ticket already drained by either native disposition
++ * is eligible; all three immutable IDs must remain available for our scan. */
++static bool coex_guard_gone_eligible(void)
++{
++    CoexNativeTicket *t = coex_ticket;
++    return coex_ticket_current(t) && t->closed && t->revoked && t->consumed &&
++        t->stage == 4 && coex_cleanup_recorded &&
++        (t->disposal == COEX_DISPOSAL_CHECKED_CLOSE ||
++         t->disposal == COEX_DISPOSAL_OLD_GENERATION_GONE) &&
++        t->key.root && t->guard && t->native &&
++        t->key.root != t->guard && t->key.root != t->native && t->guard != t->native &&
++        t->guard == coex_guard && t->native == coex_native &&
++        coex_measure_equal(&t->published.measured, &coex_measured) &&
++        t->guard_task.pid == coex_parent_pid && t->guard_task.sec == coex_parent_sec &&
++        t->guard_task.usec == coex_parent_usec &&
++        coex_state && !strcmp(coex_state, "guard-release");
++}
++static void coex_release(QDict *args, QObject **ret, Error **errp)
++{
++    uint64_t guard;
++    QDict *call = qdict_get_qdict(args, "call");
++    QBool *closed = qobject_to(QBool, qdict_get(args, "guard-closed"));
++    QBool *disposed = qobject_to(QBool, qdict_get(args, "guard-disposed-gone"));
++    bool guard_gone = coex_keys(args, "call,guard-client-id,guard-closed,guard-disposed-gone") &&
++        closed && !qbool_get_bool(closed) && disposed && qbool_get_bool(disposed);
++    bool checked_close = coex_keys(args, "call,guard-client-id,guard-closed") &&
++        closed && qbool_get_bool(closed);
++    if ((!checked_close && !guard_gone) ||
++        !coex_u64(args, "guard-client-id", &guard, !guard_gone)) {
++        error_setg(errp, "COEX_SCHEMA: invalid release"); return;
++    }
++    if (!coex_call(call, errp)) { return; }
++    /* A guard acquired locally before a failed commit was never adopted.
++     * Accept its exact ID only after an independent cache-only exact-root
++     * witness AND proof that no native ticket/Create was ever admitted. */
++    if (!guard_gone) { coex_neverstarted_ack(); }
++    pthread_mutex_lock(&session_lock);
++    bool guard_ready = !guard_gone || coex_guard_gone_eligible();
++    pthread_mutex_unlock(&session_lock);
++    bool never = !coex_ticket && coex_cleanup_recorded && !coex_native;
++    if (!guard_ready || guard != coex_guard || strcmp(coex_state, "guard-release") ||
++        (!never && (!coex_ticket || !coex_ticket->closed || !guard))) {
++        error_setg(errp, "COEX_UNCERTAIN: native closure/guard receipt required"); return;
++    }
++    CoexMeasurement m = {0};
++    bool gone = usb_host_coex_ids_gone(coex_measured.root, coex_guard, coex_native);
++    bool gone_only = guard_gone ||
++        (coex_ticket && coex_ticket->disposal == COEX_DISPOSAL_OLD_GENERATION_GONE);
++    if (!coex_generation() || (gone_only && !gone) ||
++        (!gone && !coex_tree(0, 0, false, &m)) || !coex_generation()) {
++        error_setg(errp, "COEX_UNCERTAIN: exact root not clean after guard close"); return;
++    }
++    libusb_device *dev = gone ? NULL : usb_host_coex_published(m.session, errp);
++    if (!gone && !dev) { return; }
++    libusb_device *retained = NULL;
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(coex_measured.session);
++    bool clean = s && (!guard_gone || coex_guard_gone_eligible()) &&
++        (gone || s->dev == dev) && s->epoch == coex_epoch && s->frozen &&
++        !s->handles && !s->transfers && !s->callbacks && !s->uncertain && !accounting_failed;
++    if (clean) {
++        /* Lost generation stays permanently frozen, with its immutable session
++         * tombstone. Drop only its heavy libusb reference, never thaw by port. */
++        if (gone) { retained = s->retained ? s->dev : NULL; s->dev = NULL; s->retained = false; }
++        else { s->frozen = false; }
++        coex_state = "retired";
++        coex_u64(call, "sequence", &coex_sequence, false);
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (dev) { libusb_unref_device(dev); }
++    if (retained) { libusb_unref_device(retained); }
++    if (!clean) { error_setg(errp, "COEX_STALE: release generation changed"); return; }
++    QDict *status = coex_status();
++    CoexTombstone *t = g_new0(CoexTombstone, 1);
++    t->status = qdict_clone_shallow(status); t->next = coex_retired;
++    pthread_mutex_lock(&session_lock);
++    coex_retired = t; coex_retained++;
++    pthread_mutex_unlock(&session_lock);
++    *ret = QOBJECT(status);
++}
++static void coex_register(void)
++{
++    QDict *parent;
++    g_autofree char *uuid = g_uuid_string_random();
++    unsigned j = 0;
++    coex_parent_pid = getppid();
++    parent = coex_read_task(coex_parent_pid);
++    if (parent && coex_parent_pid != getpid()) {
++        coex_u64(parent, "start-sec", &coex_parent_sec, true);
++        coex_u64(parent, "start-usec", &coex_parent_usec, true);
++        coex_task = coex_read_task(getpid());
++    }
++    qobject_unref(parent);
++    for (unsigned i = 0; uuid[i]; i++) { if (uuid[i] != '-') { coex_launch[j++] = uuid[i]; } }
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-prepare", coex_prepare, 0, 0);
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-status", coex_query, 0, 0);
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-renew", coex_renew, 0, 0);
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-revoke", coex_cancel, 0, 0);
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-commit", coex_commit, 0, 0);
++    qmp_register_command(&qmp_commands, "x-omacvm-usb-coexistence-release", coex_release, 0, 0);
++}
++type_init(coex_register)
+--- /dev/null
++++ b/hw/usb/host-coexistence-registry.inc
+@@ -0,0 +1,152 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Property-only exact allow-set validator sharing the native protected parser.
++ * Only an internal consumed ticket enables native_open admission. */
++/* Service matching omits present, unregistered registry entries (including
++ * user clients). Only a complete checked IOService-plane registry walk can
++ * witness immutable old-ID absence. One bounded pass covers all three IDs. */
++bool usb_host_coex_ids_gone(uint64_t root, uint64_t guard, uint64_t native)
++{
++    io_iterator_t it = 0;
++    if (!root) { return false; }
++    kern_return_t kr = IORegistryCreateIterator(kIOMainPortDefault,
++        kIOServicePlane, kIORegistryIterateRecursively, &it);
++    if (kr != KERN_SUCCESS || !it) {
++        if (it) { IOObjectRelease(it); }
++        return false;
++    }
++    unsigned budget = 262144;
++    bool complete = true, found = false;
++    io_object_t entry;
++    while ((entry = IOIteratorNext(it))) {
++        uint64_t id = 0;
++        complete = budget &&
++            IORegistryEntryGetRegistryEntryID(entry, &id) == KERN_SUCCESS && id;
++        if (complete) {
++            --budget;
++            found |= id == root || (guard && id == guard) || (native && id == native);
++        }
++        IOObjectRelease(entry);
++        if (!complete) { break; }
++    }
++    complete = complete && IOIteratorIsValid(it);
++    IOObjectRelease(it);
++    return complete && !found;
++}
++static bool coex_property_number(io_registry_entry_t e, CFStringRef key, uint64_t *n)
++{
++    CFTypeRef v = IORegistryEntryCreateCFProperty(e, key, kCFAllocatorDefault, 0);
++    bool ok = native_unsigned(v, n);
++    if (v) { CFRelease(v); }
++    return ok;
++}
++static bool coex_property_string(io_registry_entry_t e, CFStringRef key, const char *wanted)
++{
++    CFTypeRef v = IORegistryEntryCreateCFProperty(e, key, kCFAllocatorDefault, 0);
++    g_autofree char *s = native_string(v);
++    bool ok = s && !strcmp(s, wanted);
++    if (v) { CFRelease(v); }
++    return ok;
++}
++static bool coex_measure_snapshot(QDict *target, int pid, uint64_t cache,
++    uint64_t guard, int guard_pid, uint64_t native, bool discover,
++    bool pending, CoexMeasurement *out)
++{
++    g_autofree HostHIDState *s = g_new0(HostHIDState, 1);
++    g_autofree char *hash = NULL;
++    CoexMeasurement m = {0};
++    CoexTree tree = {.m = &m, .cache = cache, .guard = guard,
++        .guard_pid = guard_pid, .native = native, .discover = discover};
++    uint64_t page, usage, n;
++    uint32_t application = 0;
++    unsigned budget = 64, counts[3] = {0};
++    io_service_t root = 0, hid = 0;
++    CFTypeRef desc = NULL;
++    bool ok = false;
++    /* The handler has already validated canonical decimal strings. */
++    m.root = g_ascii_strtoull(qdict_get_str(target, "root-id"), NULL, 10);
++    m.interface = g_ascii_strtoull(qdict_get_str(target, "interface-id"), NULL, 10);
++    m.hid = g_ascii_strtoull(qdict_get_str(target, "hid-id"), NULL, 10);
++    m.pid = pid;
++    s->vendorid = qdict_get_int(target, "vendor-id");
++    s->productid = qdict_get_int(target, "product-id");
++    root = IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(m.root));
++    hid = IOServiceGetMatchingService(kIOMainPortDefault, IORegistryEntryIDMatching(m.hid));
++    if (!root || !hid ||
++        IORegistryEntryGetRegistryEntryID(root, &n) != KERN_SUCCESS || n != m.root ||
++        IORegistryEntryGetRegistryEntryID(hid, &n) != KERN_SUCCESS || n != m.hid ||
++        !native_root(s, root) ||
++        !coex_property_number(root, CFSTR("sessionID"), &m.session) || !m.session ||
++        !coex_property_string(root, CFSTR("USB Serial Number"), qdict_get_str(target, "serial-utf8")) ||
++        !native_metadata(hid, true, &page, &usage) ||
++        !coex_property_string(hid, CFSTR(kIOHIDTransportKey), "USB") ||
++        !coex_property_string(hid, CFSTR(kIOHIDSerialNumberKey), qdict_get_str(target, "serial-utf8")) ||
++        !coex_property_number(hid, CFSTR(kIOHIDVendorIDKey), &n) || n != s->vendorid ||
++        !coex_property_number(hid, CFSTR(kIOHIDProductIDKey), &n) || n != s->productid) { goto out; }
++    desc = IORegistryEntryCreateCFProperty(hid, CFSTR(kIOHIDReportDescriptorKey), kCFAllocatorDefault, 0);
++    if (!desc || CFGetTypeID(desc) != CFDataGetTypeID() ||
++        CFDataGetLength(desc) <= 0 || CFDataGetLength(desc) > sizeof(s->report_desc) ||
++        CFDataGetLength(desc) > sizeof(m.descriptor)) { goto out; }
++    s->report_desc_len = CFDataGetLength(desc);
++    memcpy(s->report_desc, CFDataGetBytePtr(desc), s->report_desc_len);
++    if (!host_hid_parse(s, &application) || application != ((page << 16) | usage)) { goto out; }
++    hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256, s->report_desc, s->report_desc_len);
++    if (strcmp(hash, qdict_get_str(target, "descriptor-sha256"))) { goto out; }
++    if (pending) {
++        /* A root guard may legitimately be created between prepare and commit.
++         * There is no native permission in this phase. Verify the old exact
++         * cache object/creator/parent, not a class/PID-wide child exception. */
++        /* User clients need not be registered IOService objects. IDMatching
++         * cannot find them; enumerate this exact root's children instead. */
++        io_iterator_t it = 0;
++        kern_return_t kr = IORegistryEntryGetChildIterator(root, kIOServicePlane, &it);
++        bool exact = cache && kr == KERN_SUCCESS && it;
++        io_object_t client;
++        while (exact && (client = IOIteratorNext(it))) {
++            io_name_t cls;
++            io_registry_entry_t parent = 0;
++            exact = budget &&
++                IORegistryEntryGetRegistryEntryID(client, &n) == KERN_SUCCESS && n;
++            if (exact) { --budget; }
++            if (exact && n == cache) {
++                exact = IOObjectGetClass(client, cls) == KERN_SUCCESS &&
++                    !strcmp(cls, "AppleUSBHostDeviceUserClient") &&
++                    coex_client(client, &tree, false) && m.cache == cache &&
++                    IORegistryEntryGetParentEntry(client, kIOServicePlane, &parent) == KERN_SUCCESS &&
++                    parent && IORegistryEntryGetRegistryEntryID(parent, &n) == KERN_SUCCESS && n == m.root;
++            }
++            if (parent) { IOObjectRelease(parent); }
++            IOObjectRelease(client);
++        }
++        exact = exact && IOIteratorIsValid(it) && m.cache == cache;
++        if (it) { IOObjectRelease(it); }
++        if (!exact) { goto out; }
++    } else if (!native_tree(root, m.hid, 0, 0, &budget, counts, page, usage, &tree) ||
++        counts[0] != 1 || counts[1] != 1 || !m.cache ||
++        (cache && m.cache != cache) || m.guard != guard ||
++        (discover ? !m.native : m.native != native)) { goto out; }
++    m.descriptor_len = s->report_desc_len;
++    memcpy(m.descriptor, s->report_desc, m.descriptor_len);
++    *out = m;
++    ok = true;
++out:
++    if (desc) { CFRelease(desc); }
++    if (hid) { IOObjectRelease(hid); }
++    if (root) { IOObjectRelease(root); }
++    return ok;
++}
++
++bool usb_host_coex_measure_clients(QDict *target, int pid, uint64_t cache,
++    uint64_t guard, int guard_pid, uint64_t native, bool discover, CoexMeasurement *out)
++{
++    return coex_measure_snapshot(target, pid, cache, guard, guard_pid, native,
++                                 discover, false, out);
++}
++bool usb_host_coex_measure_pending(QDict *target, int pid, uint64_t cache,
++                                     CoexMeasurement *out)
++{
++    return coex_measure_snapshot(target, pid, cache, 0, 0, 0, false, true, out);
++}
++bool usb_host_coex_measure(QDict *target, int pid, CoexMeasurement *out)
++{
++    return usb_host_coex_measure_clients(target, pid, 0, 0, 0, 0, false, out);
++}
+--- /dev/null
++++ b/hw/usb/host-coexistence.c
+@@ -0,0 +1,254 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include <libusb.h>
++#include <pthread.h>
++#include "host-coexistence.h"
++
++/* One producer, owned by host-libusb.c. Never hold this lock across USB APIs.
++ * Retain tombstones until process exit: pointer/port reuse cannot thaw a session.
++ * The bound fails closed rather than allowing unaccounted opens.
++ */
++struct USBHostSession {
++    libusb_device *dev;
++    uint64_t id, epoch;
++    unsigned handles, transfers, callbacks;
++    bool frozen, uncertain, retained;
++    USBHostSession *next;
++};
++static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
++static USBHostSession *sessions;
++static unsigned session_count;
++static uint64_t next_epoch;
++static bool accounting_failed;
++typedef struct SessionTransfer {
++    const void *transfer;
++    USBHostSession *session;
++    struct SessionTransfer *next;
++} SessionTransfer;
++static SessionTransfer *transfers;
++
++/* Only never-leased, clean, idle ordinary heavy references can disappear.
++ * Frozen/uncertain/epoch-bearing tombstones never regain authority by pointer
++ * reuse. Heavy public refs are released outside our mutex. */
++static libusb_device *session_reclaim_idle(USBHostSession *s)
++{
++    if (!s || s->epoch || s->frozen || s->uncertain || s->handles ||
++        s->transfers || s->callbacks || accounting_failed || !s->retained) { return NULL; }
++    /* Keep the bounded tiny identity tombstone, not an owning public ref.
++     * A conflicting pointer for an already published session must still poison
++     * it. The stored non-owning address is compared only, never dereferenced. */
++    s->retained = false;
++    return s->dev;
++}
++
++bool usb_host_session_submit(USBHostSession *s, const void *transfer)
++{
++    SessionTransfer *t;
++    bool ok = false;
++    pthread_mutex_lock(&session_lock);
++    if (!s || !s->handles || s->frozen || s->uncertain || accounting_failed || !transfer) {
++        goto out;
++    }
++    for (t = transfers; t; t = t->next) {
++        if (t->transfer == transfer) {
++            s->uncertain = true;
++            goto out;
++        }
++    }
++    t = g_new0(SessionTransfer, 1);
++    t->session = s;
++    t->transfer = transfer;
++    t->next = transfers;
++    transfers = t;
++    s->transfers++;
++    ok = true;
++out:
++    pthread_mutex_unlock(&session_lock);
++    return ok;
++}
++
++void usb_host_session_complete(const void *transfer)
++{
++    SessionTransfer **p, *t;
++    pthread_mutex_lock(&session_lock);
++    for (p = &transfers; (t = *p); p = &t->next) {
++        if (t->transfer == transfer) {
++            assert(t->session->transfers);
++            t->session->transfers--;
++            *p = t->next;
++            g_free(t);
++            pthread_mutex_unlock(&session_lock);
++            return;
++        }
++    }
++    accounting_failed = true;
++    pthread_mutex_unlock(&session_lock);
++}
++
++/* Move a submitted token to dispatch ownership before entering guest code.
++ * The pointer can be resubmitted by that code; the old dispatch still pins the
++ * generation until callback_end, even after ordinary close and free_transfer. */
++USBHostSession *usb_host_session_callback_begin(const void *transfer)
++{
++    SessionTransfer **p, *t;
++    USBHostSession *s = NULL;
++    pthread_mutex_lock(&session_lock);
++    for (p = &transfers; (t = *p); p = &t->next) {
++        if (t->transfer == transfer) {
++            s = t->session;
++            assert(s->transfers);
++            s->transfers--;
++            s->callbacks++;
++            *p = t->next;
++            g_free(t);
++            break;
++        }
++    }
++    if (!s) {
++        accounting_failed = true;
++    }
++    pthread_mutex_unlock(&session_lock);
++    return s;
++}
++
++void usb_host_session_callback_end(USBHostSession *s)
++{
++    libusb_device *released = NULL;
++    pthread_mutex_lock(&session_lock);
++    if (s && s->callbacks) {
++        s->callbacks--;
++        released = session_reclaim_idle(s);
++    } else {
++        accounting_failed = true;
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (released) { libusb_unref_device(released); }
++}
++
++void usb_host_session_uncertain(USBHostSession *s)
++{
++    pthread_mutex_lock(&session_lock);
++    if (s) {
++        s->uncertain = true;
++    }
++    pthread_mutex_unlock(&session_lock);
++}
++
++/* An existing handle pins native admission through all synchronous operations
++ * and checked cleanup. Only destructive reset needs to refuse freezing too. */
++bool usb_host_session_mutable(USBHostSession *s)
++{
++    bool ok;
++    pthread_mutex_lock(&session_lock);
++    ok = s && s->handles && !s->frozen && !s->uncertain && !accounting_failed;
++    pthread_mutex_unlock(&session_lock);
++    return ok;
++}
++static USBHostSession *session_find(uint64_t id)
++{
++    USBHostSession *s;
++    for (s = sessions; s; s = s->next) {
++        if (s->id == id) {
++            return s;
++        }
++    }
++    return NULL;
++}
++
++/* Public ref/getter are not device I/O; take the ref outside our mutex. */
++static USBHostSession *session_get(libusb_device *dev, uint64_t id, bool *created)
++{
++    USBHostSession *s = session_find(id);
++    if (!s && id && session_count < 4096) {
++        s = g_new0(USBHostSession, 1);
++        s->dev = dev;
++        s->retained = true;
++        s->id = id;
++        s->next = sessions;
++        sessions = s;
++        session_count++;
++        *created = true;
++    }
++    /* A reclaimed lost-generation tombstone can never reacquire a device. */
++    if (s && !s->dev && s->frozen) { return NULL; }
++    if (s && s->dev != dev) {
++        s->uncertain = true;
++        return NULL;
++    }
++    if (s && !s->retained) {
++        s->retained = true;
++        *created = true; /* Adopt caller's already-acquired public reference. */
++    }
++    return s;
++}
++
++USBHostSession *usb_host_session_acquire(libusb_device *dev)
++{
++    USBHostSession *s;
++    uint64_t id = libusb_get_session_data(dev);
++    bool created = false;
++    libusb_ref_device(dev);
++    pthread_mutex_lock(&session_lock);
++    s = session_get(dev, id, &created);
++    if (s && !s->frozen && !s->uncertain && !accounting_failed) {
++        s->handles++;
++    } else {
++        s = NULL;
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (!created) {
++        libusb_unref_device(dev);
++    }
++    return s;
++}
++
++void usb_host_session_release(USBHostSession **session)
++{
++    libusb_device *released = NULL;
++    pthread_mutex_lock(&session_lock);
++    if (*session) {
++        assert((*session)->handles);
++        (*session)->handles--;
++        released = session_reclaim_idle(*session);
++        *session = NULL;
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (released) { libusb_unref_device(released); }
++}
++
++bool usb_host_session_freeze(libusb_device *dev, uint64_t *epoch)
++{
++    USBHostSession *s;
++    bool ok = false;
++    bool created = false;
++    uint64_t id = libusb_get_session_data(dev);
++    libusb_ref_device(dev);
++    pthread_mutex_lock(&session_lock);
++    s = session_get(dev, id, &created);
++    if (s && !s->frozen && next_epoch != UINT64_MAX) {
++        s->epoch = ++next_epoch;
++        s->frozen = true;
++        *epoch = s->epoch;
++        ok = true;
++    }
++    pthread_mutex_unlock(&session_lock);
++    if (!created) {
++        libusb_unref_device(dev);
++    }
++    return ok;
++}
++
++bool usb_host_session_drained(uint64_t id, uint64_t epoch)
++{
++    bool ok;
++    pthread_mutex_lock(&session_lock);
++    USBHostSession *s = session_find(id);
++    ok = s && s->frozen && s->epoch == epoch && !s->handles &&
++         !s->transfers && !s->callbacks && !s->uncertain && !accounting_failed;
++    pthread_mutex_unlock(&session_lock);
++    return ok;
++}
++
++#if defined(CONFIG_DARWIN) && defined(CONFIG_SOFTMMU)
++#include "host-coexistence-qmp.inc"
++#endif
+--- /dev/null
++++ b/hw/usb/host-coexistence.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef HW_USB_HOST_COEXISTENCE_H
++#define HW_USB_HOST_COEXISTENCE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <libusb.h>
++
++typedef struct USBHostSession USBHostSession;
++bool usb_host_session_submit(USBHostSession *session, const void *transfer);
++void usb_host_session_complete(const void *transfer);
++USBHostSession *usb_host_session_callback_begin(const void *transfer);
++void usb_host_session_callback_end(USBHostSession *session);
++void usb_host_session_uncertain(USBHostSession *session);
++bool usb_host_session_mutable(USBHostSession *session);
++USBHostSession *usb_host_session_acquire(libusb_device *dev);
++void usb_host_session_release(USBHostSession **session);
++bool usb_host_session_freeze(libusb_device *dev, uint64_t *epoch);
++bool usb_host_session_drained(uint64_t session, uint64_t epoch);
++#endif
+--- a/hw/usb/host-libusb.c
++++ b/hw/usb/host-libusb.c
+@@ -39,6 +39,9 @@
+ #include <poll.h>
+ #endif
+ #include <libusb.h>
++#ifdef CONFIG_DARWIN
++#include "host-coexistence.h"
++#endif
+ 
+ #ifdef CONFIG_LINUX
+ #include <sys/ioctl.h>
+@@ -106,6 +109,10 @@
+     int                              hostfd;
+     libusb_device                    *dev;
+     libusb_device_handle             *dh;
++    bool                             closing, stopping, opening, close_pending;
++#ifdef CONFIG_DARWIN
++    USBHostSession                   *session;
++#endif
+     struct libusb_device_descriptor  ddesc;
+ 
+     struct {
+@@ -157,6 +164,7 @@
+     QTAILQ_HEAD_INITIALIZER(hostdevs);
+ 
+ static void usb_host_auto_check(void *unused);
++static int usb_host_close(USBHostDevice *s);
+ static void usb_host_release_interfaces(USBHostDevice *s);
+ static void usb_host_nodev(USBHostDevice *s);
+ static int usb_host_detach_kernel(USBHostDevice *s);
+@@ -325,6 +333,43 @@
+     return 0;
+ }
+ 
++#ifdef CONFIG_DARWIN
++#include "host-coexistence-platform.h"
++bool usb_host_coex_init(Error **errp)
++{
++    if (usb_host_init() != 0) {
++        error_setg(errp, "COEX_UNCERTAIN: singleton init failed");
++        return false;
++    }
++    return true;
++}
++libusb_device *usb_host_coex_published(uint64_t session, Error **errp)
++{
++    libusb_device **list = NULL, *found = NULL;
++    ssize_t n;
++    /* Called by non-OOB QMP with BQL: same singleton as ordinary/HMP. */
++    if (usb_host_init() != 0 || (n = libusb_get_device_list(ctx, &list)) < 0) {
++        error_setg(errp, "COEX_UNCERTAIN: singleton publication failed");
++        return NULL;
++    }
++    for (ssize_t i = 0; i < n; i++) {
++        if (libusb_get_session_data(list[i]) == session) {
++            if (found) {
++                libusb_unref_device(found);
++                found = NULL;
++                break;
++            }
++            found = libusb_ref_device(list[i]);
++        }
++    }
++    libusb_free_device_list(list, 1);
++    if (!found) {
++        error_setg(errp, "COEX_IDENTITY: absent or ambiguous published session");
++    }
++    return found;
++}
++#endif
++
+ static int usb_host_get_port(libusb_device *dev, char *port, size_t len)
+ {
+     uint8_t path[7];
+@@ -382,6 +427,36 @@
+ }
+ 
+ /* ------------------------------------------------------------------------ */
++
++/* All synchronous handle operations are inside its one reservation. Unknown
++ * mutation/cleanup results poison that generation; close is never a cure. */
++static int usb_host_checked(USBHostDevice *s, int rc)
++{
++#ifdef CONFIG_DARWIN
++    if (rc < 0) { usb_host_session_uncertain(s->session); }
++#endif
++    return rc;
++}
++static int usb_host_submit_transfer(USBHostDevice *s,
++                                    struct libusb_transfer *transfer)
++{
++    int rc;
++    if (!s->dh || s->closing || s->stopping) {
++        return LIBUSB_ERROR_NO_DEVICE;
++    }
++#ifdef CONFIG_DARWIN
++    if (!usb_host_session_submit(s->session, transfer)) {
++        return LIBUSB_ERROR_BUSY;
++    }
++#endif
++    rc = libusb_submit_transfer(transfer);
++#ifdef CONFIG_DARWIN
++    if (rc != 0) {
++        usb_host_session_complete(transfer);
++    }
++#endif
++    return rc;
++}
+ 
+ static USBHostRequest *usb_host_req_alloc(USBHostDevice *s, USBPacket *p,
+                                           bool in, size_t bufsize)
+@@ -408,7 +483,9 @@
+ #ifdef CONFIG_WIN32
+     request_count--;
+ #endif
+-    QTAILQ_REMOVE(&r->host->requests, r, next);
++    if (r->host) {
++        QTAILQ_REMOVE(&r->host->requests, r, next);
++    }
+     libusb_free_transfer(r->xfer);
+     g_free(r->buffer);
+     g_free(r);
+@@ -431,6 +508,16 @@
+     USBHostRequest *r = xfer->user_data;
+     USBHostDevice  *s = r->host;
+     bool disconnect = (xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
++#ifdef CONFIG_DARWIN
++    USBHostSession *callback = usb_host_session_callback_begin(xfer);
++#endif
++    /* Completed request leaves the queue before guest dispatch, which can
++     * reenter close. The callback token and QOM ref still pin its lifetime. */
++    if (s) {
++        object_ref(OBJECT(s));
++        QTAILQ_REMOVE(&s->requests, r, next);
++        r->host = NULL;
++    }
+ 
+     if (r->p == NULL) {
+         goto out; /* request was canceled */
+@@ -471,9 +558,13 @@
+ 
+ out:
+     usb_host_req_free(r);
+-    if (disconnect) {
++    if (disconnect && s) {
+         usb_host_nodev(s);
+     }
++#ifdef CONFIG_DARWIN
++    usb_host_session_callback_end(callback);
++#endif
++    if (s) { object_unref(OBJECT(s)); }
+ }
+ 
+ static void LIBUSB_CALL usb_host_req_complete_data(struct libusb_transfer *xfer)
+@@ -481,6 +572,16 @@
+     USBHostRequest *r = xfer->user_data;
+     USBHostDevice  *s = r->host;
+     bool disconnect = (xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
++#ifdef CONFIG_DARWIN
++    USBHostSession *callback = usb_host_session_callback_begin(xfer);
++#endif
++    /* Completed request leaves the queue before guest dispatch, which can
++     * reenter close. The callback token and QOM ref still pin its lifetime. */
++    if (s) {
++        object_ref(OBJECT(s));
++        QTAILQ_REMOVE(&s->requests, r, next);
++        r->host = NULL;
++    }
+ 
+     if (r->p == NULL) {
+         goto out; /* request was canceled */
+@@ -500,9 +601,13 @@
+ 
+ out:
+     usb_host_req_free(r);
+-    if (disconnect) {
++    if (disconnect && s) {
+         usb_host_nodev(s);
+     }
++#ifdef CONFIG_DARWIN
++    usb_host_session_callback_end(callback);
++#endif
++    if (s) { object_unref(OBJECT(s)); }
+ }
+ 
+ static void usb_host_req_abort(USBHostRequest *r)
+@@ -511,17 +616,18 @@
+     bool inflight = (r->p && r->p->state == USB_PACKET_ASYNC);
+ 
+     if (inflight) {
+-        r->p->status = USB_RET_NODEV;
+-        trace_usb_host_req_complete(s->bus_num, s->addr, r->p,
+-                                    r->p->status, r->p->actual_length);
+-        if (r->p->ep->nr == 0) {
+-            usb_generic_async_ctrl_complete(USB_DEVICE(s), r->p);
++        USBPacket *p = r->p;
++        r->p = NULL;
++        libusb_cancel_transfer(r->xfer);
++        p->status = USB_RET_NODEV;
++        trace_usb_host_req_complete(s->bus_num, s->addr, p,
++                                    p->status, p->actual_length);
++        if (p->ep->nr == 0) {
++            usb_generic_async_ctrl_complete(USB_DEVICE(s), p);
+         } else {
+-            usb_packet_complete(USB_DEVICE(s), r->p);
+-        }
+-        r->p = NULL;
+-
+-        libusb_cancel_transfer(r->xfer);
++            usb_packet_complete(USB_DEVICE(s), p);
++        }
++        /* Guest dispatch may have completed/freed r. Never touch it again. */
+     }
+ }
+ 
+@@ -531,11 +637,17 @@
+ usb_host_req_complete_iso(struct libusb_transfer *transfer)
+ {
+     USBHostIsoXfer *xfer = transfer->user_data;
++#ifdef CONFIG_DARWIN
++    USBHostSession *callback = usb_host_session_callback_begin(transfer);
++#endif
+ 
+     if (!xfer) {
+         /* USBHostIsoXfer released while inflight */
+         g_free(transfer->buffer);
+         libusb_free_transfer(transfer);
++#ifdef CONFIG_DARWIN
++        usb_host_session_callback_end(callback);
++#endif
+         return;
+     }
+ 
+@@ -550,6 +662,9 @@
+     } else {
+         QTAILQ_INSERT_TAIL(&xfer->ring->unused, xfer, next);
+     }
++#ifdef CONFIG_DARWIN
++    usb_host_session_callback_end(callback);
++#endif
+ }
+ 
+ static USBHostIsoRing *usb_host_iso_alloc(USBHostDevice *s, USBEndpoint *ep)
+@@ -614,6 +729,9 @@
+ static void usb_host_iso_free_xfer(USBHostIsoXfer *xfer, bool inflight)
+ {
+     if (inflight) {
++#ifdef CONFIG_DARWIN
++        usb_host_session_uncertain(xfer->ring->host->session);
++#endif
+         xfer->xfer->user_data = NULL;
+     } else {
+         g_free(xfer->xfer->buffer);
+@@ -703,7 +821,7 @@
+     while ((xfer = QTAILQ_FIRST(&ring->unused)) != NULL) {
+         QTAILQ_REMOVE(&ring->unused, xfer, next);
+         usb_host_iso_reset_xfer(xfer);
+-        rc = libusb_submit_transfer(xfer->xfer);
++        rc = usb_host_submit_transfer(s, xfer->xfer);
+         if (rc != 0) {
+             usb_host_libusb_error("libusb_submit_transfer [iso]", rc);
+             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
+@@ -765,7 +883,7 @@
+     while ((xfer = QTAILQ_FIRST(&ring->copy)) != NULL &&
+            xfer->copy_complete) {
+         QTAILQ_REMOVE(&ring->copy, xfer, next);
+-        rc = libusb_submit_transfer(xfer->xfer);
++        rc = usb_host_submit_transfer(s, xfer->xfer);
+         if (rc != 0) {
+             usb_host_libusb_error("libusb_submit_transfer [iso]", rc);
+             QTAILQ_INSERT_TAIL(&ring->unused, xfer, next);
+@@ -962,13 +1080,21 @@
+     int rc;
+     Error *local_err = NULL;
+ 
+-    if (s->bh_postld_pending) {
++    if (s->bh_postld_pending || s->closing || s->stopping || s->opening) {
+         return -1;
+     }
+     if (s->dh != NULL) {
+-        goto fail;
+-    }
+-
++        return -1;
++    }
++
++#ifdef CONFIG_DARWIN
++    /* Darwin has no supported wrapped-fd path. Reserve before either open. */
++    if (!dev || !(s->session = usb_host_session_acquire(dev))) {
++        return -1;
++    }
++#endif
++    object_ref(OBJECT(s));
++    s->opening = true;
+     if (dev) {
+         bus_num = libusb_get_bus_number(dev);
+         addr = libusb_get_device_address(dev);
+@@ -1018,6 +1144,11 @@
+         libusb_close(s->dh);
+         s->dh = NULL;
+         s->dev = NULL;
++#ifdef CONFIG_DARWIN
++        usb_host_session_release(&s->session);
++#endif
++        s->opening = false;
++        object_unref(OBJECT(s));
+         return -1;
+     }
+ 
+@@ -1085,6 +1216,14 @@
+     /* Pairs with "in use on the host" for omacvm check: the last line wins. */
+     info_report("usb-host: %04x:%04x (bus %d, addr %d) taken",
+                 s->ddesc.idVendor, s->ddesc.idProduct, bus_num, addr);
++    s->opening = false;
++    if (s->close_pending || s->stopping) {
++        s->close_pending = false;
++        usb_host_close(s);
++        object_unref(OBJECT(s));
++        return -1;
++    }
++    object_unref(OBJECT(s));
+     return 0;
+ 
+ fail:
+@@ -1094,13 +1233,18 @@
+ 
+         usb_host_release_interfaces(s);
+         if (reset) {
+-            libusb_reset_device(s->dh);
++            usb_host_checked(s, libusb_reset_device(s->dh));
+         }
+         usb_host_attach_kernel(s);
+         libusb_close(s->dh);
+         s->dh = NULL;
+         s->dev = NULL;
+     }
++#ifdef CONFIG_DARWIN
++    usb_host_session_release(&s->session);
++#endif
++    s->opening = false;
++    object_unref(OBJECT(s));
+     return -1;
+ }
+ 
+@@ -1109,7 +1253,13 @@
+     USBHostRequest *r, *rtmp;
+     int limit = 100;
+ 
+-    QTAILQ_FOREACH_SAFE(r, &s->requests, next, rtmp) {
++    for (;;) {
++        /* Do not keep a next pointer across guest dispatch: that dispatch can
++         * deliver several libusb completions and free arbitrary queue nodes. */
++        QTAILQ_FOREACH(r, &s->requests, next) {
++            if (r->p && r->p->state == USB_PACKET_ASYNC) { break; }
++        }
++        if (!r) { break; }
+         usb_host_req_abort(r);
+     }
+ 
+@@ -1119,6 +1269,9 @@
+         tv.tv_usec = 2500;
+         libusb_handle_events_timeout(ctx, &tv);
+         if (--limit == 0) {
++#ifdef CONFIG_DARWIN
++            usb_host_session_uncertain(s->session);
++#endif
+             /*
+              * Don't wait forever for libusb calling the complete
+              * callback (which will unlink and free the request).
+@@ -1128,6 +1281,8 @@
+              */
+             QTAILQ_FOREACH_SAFE(r, &s->requests, next, rtmp) {
+                 QTAILQ_REMOVE(&s->requests, r, next);
++                /* A late callback must not touch the destroyed QOM object. */
++                r->host = NULL;
+             }
+             return;
+         }
+@@ -1139,10 +1294,15 @@
+     USBDevice *udev = USB_DEVICE(s);
+     bool reset;
+ 
+-    if (s->dh == NULL) {
++    if (s->opening) { s->close_pending = true; return -1; }
++    if (s->dh == NULL || s->closing) {
+         return -1;
+     }
+ 
++    /* Event dispatch and guest detach may reenter unplug/close. The one handle
++     * reservation survives all cleanup, and QOM survives until the last access. */
++    object_ref(OBJECT(s));
++    s->closing = true;
+     trace_usb_host_close(s->bus_num, s->addr);
+ 
+     usb_host_abort_xfers(s);
+@@ -1155,10 +1315,13 @@
+     reset = usb_host_may_reset(s);
+     usb_host_release_interfaces(s);
+     if (reset) {
+-        libusb_reset_device(s->dh);
++        usb_host_checked(s, libusb_reset_device(s->dh));
+     }
+     usb_host_attach_kernel(s);
+     libusb_close(s->dh);
++#ifdef CONFIG_DARWIN
++    usb_host_session_release(&s->session);
++#endif
+     s->dh = NULL;
+     s->dev = NULL;
+ 
+@@ -1167,7 +1330,9 @@
+         s->hostfd = -1;
+     }
+ 
+-    usb_host_auto_check(NULL);
++    s->closing = false;
++    if (!s->stopping) { usb_host_auto_check(NULL); }
++    object_unref(OBJECT(s));
+     return 0;
+ }
+ 
+@@ -1179,6 +1344,7 @@
+ 
+ static void usb_host_nodev(USBHostDevice *s)
+ {
++    if (s->stopping || s->closing) { return; }
+     if (!s->bh_nodev) {
+         s->bh_nodev = qemu_bh_new_guarded(usb_host_nodev_bh, s,
+                                           &DEVICE(s)->mem_reentrancy_guard);
+@@ -1190,17 +1356,8 @@
+ {
+     USBHostDevice *s = container_of(n, USBHostDevice, exit);
+ 
+-    if (s->dh) {
+-        bool reset = usb_host_may_reset(s);
+-
+-        usb_host_abort_xfers(s);
+-        usb_host_release_interfaces(s);
+-        if (reset) {
+-            libusb_reset_device(s->dh);
+-        }
+-        usb_host_attach_kernel(s);
+-        libusb_close(s->dh);
+-    }
++    s->stopping = true;
++    usb_host_close(s);
+ }
+ 
+ static libusb_device *usb_host_find_ref(int bus, int addr)
+@@ -1313,6 +1470,10 @@
+ {
+     USBHostDevice *s = USB_HOST_DEVICE(udev);
+ 
++    s->stopping = true;
++    if (s->bh_nodev) { qemu_bh_delete(s->bh_nodev); s->bh_nodev = NULL; }
++    if (s->bh_postld) { qemu_bh_delete(s->bh_postld); s->bh_postld = NULL; }
++    s->bh_postld_pending = false;
+     qemu_remove_exit_notifier(&s->exit);
+     if (s->needs_autoscan) {
+         QTAILQ_REMOVE(&hostdevs, s, next);
+@@ -1405,6 +1566,10 @@
+ #ifdef CONFIG_DARWIN
+     int i;
+ 
++    if (!s->dh || !usb_host_session_mutable(s->session)) {
++        return false;
++    }
++
+     for (i = 0; i < USB_MAX_INTERFACES; i++) {
+         if (s->ifs[i].claimed || s->ifs[i].detached) {
+             return true;
+@@ -1418,22 +1583,22 @@
+ 
+ static void usb_host_attach_kernel(USBHostDevice *s)
+ {
+-    struct libusb_config_descriptor *conf;
+     int rc, i;
+ 
+-    rc = libusb_get_active_config_descriptor(s->dev, &conf);
+-    if (rc != 0) {
+-        return;
+-    }
+     for (i = 0; i < USB_MAX_INTERFACES; i++) {
+         if (!s->ifs[i].detached) {
+             continue;
+         }
+         trace_usb_host_attach_kernel(s->bus_num, s->addr, i);
+-        libusb_attach_kernel_driver(s->dh, i);
+-        s->ifs[i].detached = false;
+-    }
+-    libusb_free_config_descriptor(conf);
++        rc = libusb_attach_kernel_driver(s->dh, i);
++        usb_host_libusb_error("libusb_attach_kernel_driver", rc);
++        if (rc == 0) {
++            s->ifs[i].detached = false;
++        }
++#ifdef CONFIG_DARWIN
++        else { usb_host_session_uncertain(s->session); }
++#endif
++    }
+ }
+ 
+ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
+@@ -1471,6 +1636,7 @@
+         }
+     }
+     if (claimed != conf->bNumInterfaces) {
++        libusb_free_config_descriptor(conf);
+         return USB_RET_STALL;
+     }
+ 
+@@ -1492,7 +1658,12 @@
+         trace_usb_host_release_interface(s->bus_num, s->addr, i);
+         rc = libusb_release_interface(s->dh, i);
+         usb_host_libusb_error("libusb_release_interface", rc);
+-        s->ifs[i].claimed = false;
++        if (rc == 0) {
++            s->ifs[i].claimed = false;
++        }
++#ifdef CONFIG_DARWIN
++        else { usb_host_session_uncertain(s->session); }
++#endif
+     }
+ }
+ 
+@@ -1512,7 +1683,7 @@
+ 
+     usb_host_release_interfaces(s);
+     if (s->ddesc.bNumConfigurations != 1) {
+-        rc = libusb_set_configuration(s->dh, config);
++        rc = usb_host_checked(s, libusb_set_configuration(s->dh, config));
+         if (rc != 0) {
+             usb_host_libusb_error("libusb_set_configuration", rc);
+             p->status = USB_RET_STALL;
+@@ -1544,7 +1715,7 @@
+         return;
+     }
+ 
+-    rc = libusb_set_interface_alt_setting(s->dh, iface, alt);
++    rc = usb_host_checked(s, libusb_set_interface_alt_setting(s->dh, iface, alt));
+     if (rc != 0) {
+         usb_host_libusb_error("libusb_set_interface_alt_setting", rc);
+         p->status = USB_RET_STALL;
+@@ -1568,7 +1739,7 @@
+ 
+     trace_usb_host_req_control(s->bus_num, s->addr, p, request, value, index);
+ 
+-    if (s->dh == NULL) {
++    if (s->dh == NULL || s->closing || s->stopping) {
+         p->status = USB_RET_NODEV;
+         trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
+         return;
+@@ -1593,7 +1764,8 @@
+     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
+         if (value == 0) { /* clear halt */
+             int pid = (index & USB_DIR_IN) ? USB_TOKEN_IN : USB_TOKEN_OUT;
+-            libusb_clear_halt(s->dh, index);
++            rc = usb_host_checked(s, libusb_clear_halt(s->dh, index));
++            if (rc != 0) { p->status = USB_RET_STALL; return; }
+             usb_ep_set_halted(udev, pid, index & 0x0f, 0);
+             trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
+             return;
+@@ -1619,7 +1791,7 @@
+     libusb_fill_control_transfer(r->xfer, s->dh, r->buffer,
+                                  usb_host_req_complete_ctrl, r,
+                                  CONTROL_TIMEOUT);
+-    rc = libusb_submit_transfer(r->xfer);
++    rc = usb_host_submit_transfer(s, r->xfer);
+     if (rc != 0) {
+         p->status = USB_RET_NODEV;
+         trace_usb_host_req_complete(s->bus_num, s->addr, p,
+@@ -1627,6 +1799,7 @@
+         if (rc == LIBUSB_ERROR_NO_DEVICE) {
+             usb_host_nodev(s);
+         }
++        usb_host_req_free(r); /* Failed submit will never deliver a callback. */
+         return;
+     }
+ 
+@@ -1649,7 +1822,7 @@
+                             p->pid == USB_TOKEN_IN,
+                             p->ep->nr, p->iov.size);
+ 
+-    if (s->dh == NULL) {
++    if (s->dh == NULL || s->closing || s->stopping) {
+         p->status = USB_RET_NODEV;
+         trace_usb_host_req_emulated(s->bus_num, s->addr, p, p->status);
+         return;
+@@ -1713,7 +1886,7 @@
+         return;
+     }
+ 
+-    rc = libusb_submit_transfer(r->xfer);
++    rc = usb_host_submit_transfer(s, r->xfer);
+     if (rc != 0) {
+         p->status = USB_RET_NODEV;
+         trace_usb_host_req_complete(s->bus_num, s->addr, p,
+@@ -1721,6 +1894,7 @@
+         if (rc == LIBUSB_ERROR_NO_DEVICE) {
+             usb_host_nodev(s);
+         }
++        usb_host_req_free(r); /* Failed submit will never deliver a callback. */
+         return;
+     }
+ 
+@@ -1751,7 +1925,7 @@
+ 
+     trace_usb_host_reset(s->bus_num, s->addr);
+ 
+-    rc = libusb_reset_device(s->dh);
++    rc = usb_host_checked(s, libusb_reset_device(s->dh));
+     if (rc != 0) {
+         usb_host_nodev(s);
+     }
+@@ -1765,16 +1939,18 @@
+     unsigned char endpoints[30];
+     int i, rc;
+ 
++    if (!s->dh || s->closing || s->stopping || nr_eps < 0 || nr_eps > 30) { return -1; }
+     for (i = 0; i < nr_eps; i++) {
+         endpoints[i] = eps[i]->nr;
+         if (eps[i]->pid == USB_TOKEN_IN) {
+             endpoints[i] |= 0x80;
+         }
+     }
+-    rc = libusb_alloc_streams(s->dh, streams, endpoints, nr_eps);
++    rc = usb_host_checked(s, libusb_alloc_streams(s->dh, streams, endpoints, nr_eps));
+     if (rc < 0) {
+         usb_host_libusb_error("libusb_alloc_streams", rc);
+     } else if (rc != streams) {
++        usb_host_checked(s, LIBUSB_ERROR_IO);
+         error_report("libusb_alloc_streams: got less streams "
+                      "then requested %d < %d", rc, streams);
+     }
+@@ -1794,13 +1970,14 @@
+     unsigned char endpoints[30];
+     int i;
+ 
++    if (!s->dh || nr_eps < 0 || nr_eps > 30) { return; }
+     for (i = 0; i < nr_eps; i++) {
+         endpoints[i] = eps[i]->nr;
+         if (eps[i]->pid == USB_TOKEN_IN) {
+             endpoints[i] |= 0x80;
+         }
+     }
+-    libusb_free_streams(s->dh, endpoints, nr_eps);
++    usb_host_checked(s, libusb_free_streams(s->dh, endpoints, nr_eps));
+ #endif
+ }
+ 
+@@ -2052,6 +2229,13 @@
+                        ddesc.idVendor, ddesc.idProduct);
+         if (ddesc.iProduct) {
+             libusb_device_handle *handle;
++#ifdef CONFIG_DARWIN
++            USBHostSession *session = usb_host_session_acquire(devs[i]);
++            if (!session) {
++                monitor_printf(mon, "\n");
++                continue;
++            }
++#endif
+             if (libusb_open(devs[i], &handle) == 0) {
+                 unsigned char name[64] = "";
+                 libusb_get_string_descriptor_ascii(handle,
+@@ -2060,6 +2244,9 @@
+                 libusb_close(handle);
+                 monitor_printf(mon, ", %s", name);
+             }
++#ifdef CONFIG_DARWIN
++            usb_host_session_release(&session);
++#endif
+         }
+         monitor_printf(mon, "\n");
+     }
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -89,6 +89,10 @@
+   usbhost_ss = ss.source_set()
+   usbhost_ss.add(when: ['CONFIG_USB', libusb],
+                  if_true: files('host-libusb.c'))
++  if host_os == 'darwin'
++    usbhost_ss.add(when: ['CONFIG_USB', libusb],
++                   if_true: files('host-coexistence.c'))
++  endif
+   hw_usb_modules += {'host': usbhost_ss}
+ endif
+ 

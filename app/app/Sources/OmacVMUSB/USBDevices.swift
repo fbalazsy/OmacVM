@@ -42,6 +42,8 @@ public struct USBDeviceID: Hashable, Comparable, Sendable, CustomStringConvertib
 
 /// One device the Mac sees, read from the IORegistry (nothing is opened).
 public struct USBDevice: Equatable, Sendable {
+    /// Root generation retained even when our own client changes eligibility.
+    public var coexistenceRootID: UInt64? = nil
     public struct Interface: Equatable, Sendable {
         public var number: Int
         public var interfaceClass: Int
@@ -76,6 +78,7 @@ public struct USBDevice: Equatable, Sendable {
     /// Its HID part, when it is a vendor HID device QEMU's usb-host-hid can
     /// take (read only while the "Vendor HID devices" switch is on).
     public var hid: USBHID?
+    public var coexistence: USBCoexistenceCandidate? = nil
 
     public init(id: USBDeviceID, name: String, deviceClass: Int, drivers: [String] = [], interfaces: [Interface],
                 serial: String = "", maker: String = "", location: UInt32 = 0, address: Int = 0, hid: USBHID? = nil) {
@@ -103,6 +106,8 @@ public struct USBDevice: Equatable, Sendable {
     public enum Availability: Equatable, Sendable {
         /// Nothing on the Mac uses it: a VM can have it.
         case free
+        /// Requires prepare/guard/commit; never ordinary USB admission.
+        case pendingCoexistence
         /// macOS uses it (why, in a few words): it stays with the Mac.
         case usedByMac(String)
         /// Never offered (a hub, a USB-C adapter's info device).
@@ -120,6 +125,7 @@ public struct USBDevice: Equatable, Sendable {
             return .notOffered("a USB-C adapter's info device")
         }
         // macOS's HID driver has it, and usb-host-hid shares it with the Mac.
+        if coexistence != nil { return .pendingCoexistence }
         if hid != nil { return .free }
         let users = drivers + interfaces.flatMap(\.users)
         if let u = users.first { return .usedByMac(USBDevice.reason(u)) }

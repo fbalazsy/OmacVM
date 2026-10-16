@@ -184,11 +184,17 @@ extension USBScan {
     /// The device as `device(_:)` reads it and, with `hid` (the switch on),
     /// its HID part when it is a vendor HID device. Without `hid` exactly
     /// `device(_:)`.
-    public static func device(_ dev: io_registry_entry_t, hid: Bool) -> USBDevice? {
+    public static func device(_ dev: io_registry_entry_t, hid: Bool, coexistencePID: Int32? = nil) -> USBDevice? {
         guard var d = device(dev) else { return nil }
+        if hid {
+            var rootID: UInt64 = 0
+            if IORegistryEntryGetRegistryEntryID(dev, &rootID) == KERN_SUCCESS, rootID != 0 { d.coexistenceRootID = rootID }
+        }
         if hid, USBHID.candidate(d) {
             var budget = 128
-            d.hid = USBHID.resolve(readEntry(dev, depth: 0, budget: &budget))
+            let root = readEntry(dev, depth: 0, budget: &budget)
+            d.coexistence = USBCoexistenceCandidate.resolve(root,qemuPID:coexistencePID)
+            d.hid = d.coexistence.map { USBHID(registryID:$0.target.hid,serial:String(decoding:$0.target.serial,as:UTF8.self)) }
         }
         return d
     }
@@ -226,7 +232,8 @@ extension USBScan {
         if IOObjectConformsTo(e, "IOHIDDevice") != 0 { node.conforms.insert("IOHIDDevice") }
         for key in ["idVendor", "idProduct", "bDeviceClass", "bInterfaceClass", "bInterfaceSubClass",
                     "bInterfaceProtocol", "VendorID", "ProductID", "SerialNumber", "Product", "Transport", "ReportDescriptor",
-                    "Built-In", "PrimaryUsagePage", "PrimaryUsage", "DeviceUsagePairs"] {
+                    "Built-In", "PrimaryUsagePage", "PrimaryUsage", "DeviceUsagePairs",
+                    "built-in", "sessionID", "USB Serial Number", "IOUserClientCreator"] {
             node.properties[key] = property(e, key)
         }
         var it: io_iterator_t = 0

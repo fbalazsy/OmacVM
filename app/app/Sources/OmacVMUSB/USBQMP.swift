@@ -20,6 +20,7 @@ public enum USBQMP {
     public static func qemuID(location: UInt32) -> String { String(format: "usbh-%08x", location) }
 
     public static func attachArguments(_ d: USBDevice) -> [String: Any] {
+        if d.coexistence != nil { return [:] }
         // A vendor HID device (switch on): by its HID part, which QEMU checks
         // again and opens through IOHIDDevice (USBHID.swift).
         if let hid = d.hid {
@@ -58,6 +59,7 @@ public enum USBQMP {
     /// (checked every 0.3 s for up to 3 s). Else it is removed again.
     public static func attach(_ d: USBDevice, over qmp: USBQMPTransport,
                               wait: (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }) -> USBAttachResult {
+        guard d.coexistence == nil else { return .failed("Coexistence coordinator required") }
         let id = qemuID(location: d.location)
         do {
             _ = try qmp.execute("device_add", attachArguments(d))

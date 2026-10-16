@@ -95,6 +95,7 @@ mapped_sections_patch="$native_dir/patches/qemu-hvf-mapped-sections.patch"
 strchrnul_patch="$native_dir/patches/qemu-darwin-strchrnul-compat.patch"
 usb_exact_bus_patch="$native_dir/patches/qemu-usb-host-exact-bus.patch"
 usb_hid_patch="$native_dir/patches/qemu-usb-host-hid.patch"
+usb_coexistence_patch="$native_dir/patches/qemu-usb-session-accounting.patch"
 slirp_patch="$native_dir/patches/libslirp-darwin-icmp-matching.patch"
 udp_patch="$native_dir/patches/libslirp-ipv4-udp-translation.patch"
 fence_poll_patch="$native_dir/patches/qemu-darwin-gpu-fence-poll.patch"
@@ -202,6 +203,7 @@ virgl_caps_sampler_limit_patch_sha256=ec779a77aab1384dd5f2c046e9d3238ee11c840dd1
 strchrnul_patch_sha256=ec1048dd0e8ebe53bf7e8a3bca9bf2f5f4336cd607d4cd077437470e9a32094a
 usb_exact_bus_patch_sha256=5e39159171295c566d014a1ef2744130f80fa02b742c349fa47373b00ae697ec
 usb_hid_patch_sha256=a96d81f06f61020b47baa04a70cdec508d8fddc6295d20673ee576b64d1e7201
+usb_coexistence_patch_sha256=d7fcbabdb2eff0c7d50bdff49904b91136cbbd4d908f5912835d01c66595fd5c
 udp_patch_sha256=95e8ee890be78cdce70b3ee54a8adac27be02421be08b986ae987c74ef8cec8c
 slirp_patch_sha256=20f3d424c79929fb82d240d0ee06b99e9f93ecfb9460579dc414303820d59f90
 slirp_source_root=libslirp-v4.9.4
@@ -335,6 +337,8 @@ macos_major=$(sw_vers -productVersion | awk -F. '{ print $1 }')
   die "missing USB exact-bus patch: $usb_exact_bus_patch"
 [[ -f $usb_hid_patch && ! -L $usb_hid_patch ]] || \
   die "missing USB vendor HID patch: $usb_hid_patch"
+[[ -f $usb_coexistence_patch && ! -L $usb_coexistence_patch ]] || \
+  die "missing USB coexistence patch: $usb_coexistence_patch"
 [[ -x $prepare_runtime && ! -L $prepare_runtime ]] || \
   die "missing runtime preparation script: $prepare_runtime"
 if [[ -n $archive_cache ]]; then
@@ -633,6 +637,9 @@ patch -d "$source_dir" -p1 -f -i "$usb_hid_patch"
 # OmacVM: usb-host leaves a device the Mac uses alone (no reset: on macOS that
 # re-enumerates it); the app's USB devices (docs/usb.md).
 patch -d "$source_dir" -p1 -f -i "$native_dir/patches/qemu-usb-host-busy-device.patch"
+# Exact-generation coexistence with native HID; ordinary USB stays on libusb.
+verify_file_sha "USB coexistence patch" "$usb_coexistence_patch" "$usb_coexistence_patch_sha256"
+patch -d "$source_dir" -p1 -f -i "$usb_coexistence_patch"
 # OmacVM: a main loop stall > 2 s is logged with its place.
 patch -d "$source_dir" -p1 -f -i "$native_dir/patches/qemu-main-loop-stall-watchdog.patch"
 # OmacVM: app name and icon from the launcher; Quit shuts the guest down;

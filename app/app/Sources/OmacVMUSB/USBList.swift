@@ -55,6 +55,8 @@ public struct USBListRows: Equatable, Sendable {
             switch states[d.location] {
             case .connected?: return ("Connected to \(vmName)", false, true)
             case .connecting?: return ("Connecting…", false, false)
+            case .coexistencePending?: return ("USB release pending", false, true)
+            case .disconnecting?: return ("Disconnecting…", false, false)
             // Asking: answered in the question (Connect here would race it).
             case .asking?: return ("Plugged in, waiting for your answer", false, false)
             case .waiting?: return ("Plugged in, waiting for your answer", true, false)
@@ -62,7 +64,7 @@ public struct USBListRows: Equatable, Sendable {
             default: return ("Plugged in, on the Mac", true, false)
             }
         }
-        let free = devices.filter { $0.availability == .free }
+        let free = devices.filter { $0.availability == .free || $0.availability == .pendingCoexistence }
         for e in memory.devices {
             // The plugged-in device this entry is for (USBMemory.entry picks the entry per device).
             let d = free.first { !used.contains($0.location) && memory.entry(for: $0) == e }

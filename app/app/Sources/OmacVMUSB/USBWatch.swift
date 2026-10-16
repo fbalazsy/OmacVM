@@ -12,6 +12,7 @@ import IOKit
 public final class USBWatch {
     public var onPlug: (USBDevice) -> Void = { _ in }
     public var onUnplug: (UInt32) -> Void = { _ in }
+    public var onUnplugGeneration: ((UInt32, UInt64) -> Void)?
 
     private var port: IONotificationPortRef?
     private var added: io_iterator_t = 0
@@ -22,6 +23,7 @@ public final class USBWatch {
     private var settling = Set<UInt64>()
     private var leftEarly = Set<UInt64>()
     private let hid: Bool
+    private let coexistencePID: Int32?
     private var hidAdded: io_iterator_t = 0
     private var hidRemoved: io_iterator_t = 0
     /// A HID part's IORegistry entry id -> its USB device's (as reported).
@@ -31,8 +33,9 @@ public final class USBWatch {
     private let settle = DispatchQueue(label: "org.omacvm.usb-watch", qos: .utility, attributes: .concurrent)
     private var running = false
 
-    public init(hid: Bool = false) {
+    public init(hid: Bool = false, coexistencePID: Int32? = nil) {
         self.hid = hid
+        self.coexistencePID = coexistencePID
     }
 
     public func start() {
@@ -93,6 +96,7 @@ public final class USBWatch {
             IORegistryEntryGetRegistryEntryID(dev, &entry)
             settling.insert(entry)
             let hid = self.hid
+            let coexistencePID = self.coexistencePID
             // Read off the main thread: waiting for macOS's drivers takes up to 2 s.
             settle.async { [weak self] in
                 if !initial {
@@ -101,7 +105,7 @@ public final class USBWatch {
                     // Apps that use a device (usbmuxd, usbaudiod) open it a moment after the drivers.
                     Thread.sleep(forTimeInterval: 0.5)
                 }
-                let d = USBScan.device(dev, hid: hid)
+                let d = USBScan.device(dev, hid: hid, coexistencePID:coexistencePID)
                 IOObjectRelease(dev)
                 DispatchQueue.main.async {
                     guard let self, self.running else { return }
@@ -127,7 +131,8 @@ public final class USBWatch {
                 leftEarly.insert(entry)
             } else if let loc = places.removeValue(forKey: entry) {
                 hidParts = hidParts.filter { $0.value != entry }
-                onUnplug(loc)
+                if let onUnplugGeneration { onUnplugGeneration(loc,entry) }
+                else { onUnplug(loc) }
             }
         }
     }
@@ -135,6 +140,7 @@ public final class USBWatch {
     private func report(_ d: USBDevice, entry: UInt64) {
         hidParts = hidParts.filter { $0.value != entry }
         if let h = d.hid { hidParts[h.registryID] = entry }
+        else if let c = d.coexistence { hidParts[c.target.hid] = entry }
         onPlug(d)
     }
 
@@ -186,11 +192,12 @@ public final class USBWatch {
             IOObjectRelease(dev)
             return
         }
+        let coexistencePID = self.coexistencePID
         settle.async { [weak self] in
             var wait = mach_timespec_t(tv_sec: 2, tv_nsec: 0)
             _ = IOServiceWaitQuiet(dev, &wait)
             Thread.sleep(forTimeInterval: 0.5)
-            let d = USBScan.device(dev, hid: true)
+            let d = USBScan.device(dev, hid: true, coexistencePID:coexistencePID)
             IOObjectRelease(dev)
             DispatchQueue.main.async {
                 guard let self, self.running, let d else { return }

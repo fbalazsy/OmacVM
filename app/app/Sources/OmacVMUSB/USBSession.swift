@@ -18,8 +18,13 @@ import Foundation
 public protocol USBMachine: AnyObject {
     func attach(_ device: USBDevice, done: @escaping (USBAttachResult) -> Void)
     func detach(_ device: USBDevice, done: @escaping (Bool) -> Void)
+    func retryRelease(_ device: USBDevice, done: @escaping (Bool) -> Void)
     /// Does the VM still have it (after the Mac saw it go)?
     func isAttached(_ device: USBDevice, done: @escaping (Bool) -> Void)
+}
+
+public extension USBMachine {
+    func retryRelease(_ device: USBDevice, done: @escaping (Bool) -> Void) { detach(device,done:done) }
 }
 
 /// The question, and a short notice when something did not work.
@@ -93,6 +98,8 @@ public final class USBSession {
         case asking
         case connecting
         case connected
+        case coexistencePending
+        case disconnecting
         /// Unplugged while the VM had it: waiting `grace` for it to come back.
         case leaving
         /// Stays with the Mac: remembered (or "this time").
@@ -125,6 +132,10 @@ public final class USBSession {
     /// Something changed (the list follows it).
     public var onChange: (() -> Void)?
 
+    private var pendingReplacement: [UInt32: USBDevice] = [:]
+    // Device equality does not distinguish repeated attachment attempts.
+    private var coexistenceAttempts: [UInt32: UUID] = [:]
+    private var absentOwners = Set<UInt32>()
     private let machine: USBMachine
     private let asker: USBAsker
     private let clock: USBClock
@@ -147,12 +158,25 @@ public final class USBSession {
     /// A device appeared (or was there when the VM started).
     public func plugged(_ d: USBDevice) {
         guard !stopped else { return }
+        // A held/uncertain generation owns this location until confirmed retire.
+        // Publication of our guard/native clients is not a device replacement.
+        if let p = plugs[d.location], p.device.coexistence != nil,
+           [.connecting, .connected, .coexistencePending, .disconnecting].contains(p.state) {
+            let sameRoot = d.coexistenceRootID != nil && d.coexistenceRootID == p.device.coexistence?.target.root
+            let sameTarget = d.coexistence?.target == p.device.coexistence?.target
+            // Our own client publication can remove eligibility, not root identity.
+            if !sameTarget && !(sameRoot && d.coexistence == nil) {
+                pendingReplacement[d.location] = d
+                if p.state == .connected { unpluggedOwner(location:d.location, device:p.device) }
+            }
+            return
+        }
         // Vendor HID devices (switch on): the same device read again with a
         // new HID part, or without one (USBWatch). QEMU's usb-host-hid is tied
         // to the part it opened, so this is a new device: the VM gives the old
         // one back, and this one is asked about or remembered like any other.
         // (Unplugged and back: the reset below.) Never while the switch is off.
-        if let p = plugs[d.location], p.state != .leaving, p.device.hid != d.hid {
+        if let p = plugs[d.location], p.state != .leaving, p.device.hid != d.hid || p.device.coexistence != d.coexistence {
             if p.state == .asking {
                 asker.cancel()
                 asking = nil
@@ -184,7 +208,7 @@ public final class USBSession {
             p = Plug(device: d, state: .ignored, how: "")
         case .usedByMac(let why):
             p = Plug(device: d, state: .kept(why), how: "")
-        case .free:
+        case .free, .pendingCoexistence:
             switch memory.plan(for: d) {
             case .omarchy:
                 plugs[d.location] = Plug(device: d, state: .waiting, how: "remembered")
@@ -205,8 +229,17 @@ public final class USBSession {
     }
 
     /// A device went away.
-    public func unplugged(location: UInt32) {
+    public func unplugged(location: UInt32, rootID: UInt64? = nil) {
         guard !stopped, let p = plugs[location] else { return }
+        if let replacement = pendingReplacement[location],
+           rootID == nil || rootID == replacement.coexistenceRootID || rootID == replacement.coexistence?.target.root {
+            pendingReplacement[location] = nil; changed(); return
+        }
+        if let rootID, let ownedRoot = p.device.coexistence?.target.root ?? p.device.coexistenceRootID,
+           rootID != ownedRoot { return }
+        if p.device.coexistence != nil, [.connecting, .connected, .coexistencePending, .disconnecting].contains(p.state) {
+            unpluggedOwner(location:location, device:p.device); return
+        }
         switch p.state {
         case .asking:
             asker.cancel()
@@ -241,6 +274,33 @@ public final class USBSession {
         default:
             plugs[location] = nil
         }
+        changed()
+    }
+
+    private func unpluggedOwner(location: UInt32, device: USBDevice) {
+        absentOwners.insert(location)
+        plugs[location]?.state = .coexistencePending
+        let attempt = coexistenceAttempts[location]
+        machine.detach(device) { [weak self] released in
+            guard released, let self, self.coexistenceAttempts[location] == attempt else { return }
+            self.retireOwner(device)
+        }
+        changed()
+    }
+
+    private func retireOwner(_ device: USBDevice) {
+        let location = device.location
+        guard !stopped, plugs[location]?.device == device else { return }
+        coexistenceAttempts[location] = nil
+        if let next = pendingReplacement.removeValue(forKey:location) {
+            absentOwners.remove(location)
+            plugs[location] = nil
+            plugged(next) // evaluate its own current policy and saved plan
+            askNext()
+        } else if absentOwners.remove(location) != nil {
+            plugs[location] = nil
+            askNext()
+        } else { plugs[location]?.state = .onMac(remembered:false) }
         changed()
     }
 
@@ -284,6 +344,8 @@ public final class USBSession {
         asking = nil
         queue.removeAll()
         plugs.removeAll()
+        coexistenceAttempts.removeAll()
+        pendingReplacement.removeAll(); absentOwners.removeAll()
         changed()
     }
 
@@ -351,7 +413,10 @@ public final class USBSession {
         p.how = how
         plugs[loc] = p
         changed()
+        let attempt = p.device.coexistence == nil ? nil : UUID()
+        if let attempt { coexistenceAttempts[loc] = attempt }
         machine.attach(p.device) { [weak self] result in
+            if let attempt, self?.coexistenceAttempts[loc] != attempt { return }
             self?.attachDone(loc, p.device, result)
         }
     }
@@ -376,8 +441,11 @@ public final class USBSession {
             p.state = .connected
             plugs[loc] = p
             log("OmacVM: USB: \(Self.label(d)) connected (\(p.how))")
+            if d.coexistence != nil, pendingReplacement[loc] != nil {
+                unpluggedOwner(location:loc,device:d)
+            }
         case .busy, .gone, .full, .failed:
-            p.state = .onMac(remembered: false)
+            p.state = d.coexistence == nil ? .onMac(remembered: false) : .coexistencePending
             plugs[loc] = p
             log("OmacVM: USB: \(Self.label(d)) not connected: \(Self.why(result))")
             if result != .gone {
@@ -401,12 +469,34 @@ public final class USBSession {
 
     /// Gives it back to the Mac now (the list's Disconnect).
     public func disconnectNow(location: UInt32) {
-        guard !stopped, var p = plugs[location], p.state == .connected else { return }
+        guard !stopped, var p = plugs[location], p.state == .connected || (p.device.coexistence != nil && p.state == .coexistencePending) else { return }
+        if p.device.coexistence != nil {
+            p.state = .disconnecting; plugs[location] = p; changed()
+            let attempt = coexistenceAttempts[location]
+            machine.retryRelease(p.device) { [weak self] released in
+                guard let self, self.plugs[location]?.device == p.device, self.coexistenceAttempts[location] == attempt else { return }
+                if released { self.retireOwner(p.device) }
+                else { self.plugs[location]?.state = .coexistencePending; self.changed() }
+            }
+            return
+        }
         p.state = .onMac(remembered: false)
         p.how = "from the list"
         plugs[location] = p
         machine.detach(p.device) { _ in }
         log("OmacVM: USB: \(Self.label(p.device)) disconnected (from the list)")
+        changed()
+    }
+
+    /// Only coordinator receipts change target ownership, never monitor EOF or
+    /// a disappearing IORegistry row. Called on the session thread by USBRun.
+    public func coexistencePhase(_ phase: USBCoexistenceCoordinator.Phase, device: USBDevice) {
+        guard !stopped, plugs[device.location]?.device == device else { return }
+        switch phase {
+        case .uncertain, .revoking: plugs[device.location]?.state = .coexistencePending
+        case .retired, .refused: retireOwner(device)
+        default: break
+        }
         changed()
     }
 
